@@ -2,12 +2,12 @@ package com.nicholas.onote.drawing
 
 import android.graphics.Path
 
-enum class Tool {
-    BALLPOINT,
-    PENCIL,
-    FOUNTAIN,
-    MARKER,
-    HIGHLIGHTER
+enum class Tool(val displayName: String) {
+    BALLPOINT("Ballpoint"),
+    PENCIL("Pencil"),
+    FOUNTAIN("Fountain"),
+    MARKER("Marker"),
+    HIGHLIGHTER("Highlighter")
 }
 
 enum class ToolMode(val displayName: String) {
@@ -58,7 +58,8 @@ class Dot(
 class CompletedStroke(
     val color: Int,
     val points: ArrayList<StrokePoint>,
-    val baseWidth: Float
+    val baseWidth: Float,
+    val tool: Tool
 ) {
     var ribbon: StrokeRenderer.Ribbon = StrokeRenderer.buildRibbon(points, baseWidth)
         private set

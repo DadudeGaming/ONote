@@ -1,8 +1,5 @@
 package com.nicholas.onote.ui
 
-import android.content.Context
-import android.content.pm.PackageManager
-import android.os.Build
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -24,11 +21,15 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.nicholas.onote.data.PageMode
+import com.nicholas.onote.drawing.PageBackground
 import com.nicholas.onote.drawing.DrawingEngine
 import com.nicholas.onote.settings.AppSettings
 import com.nicholas.onote.settings.ThemeMode
@@ -37,9 +38,11 @@ import com.nicholas.onote.settings.ThemeMode
 @Composable
 fun SettingsScreen(
     settings: AppSettings,
-    engine: DrawingEngine,
+    engine: DrawingEngine?,
     onBack: () -> Unit
 ) {
+    var aboutOpen by remember { mutableStateOf(false) }
+
     Scaffold(
         topBar = {
             TopAppBar(
@@ -76,36 +79,74 @@ fun SettingsScreen(
                 }
             }
 
+            HorizontalDivider()
+
             SectionTitle("Input")
 
             ToggleRow(
                 title = "Palm rejection",
                 subtitle = "Ignore fingers/palm while the S Pen writes",
-                checked = settings.palmRejection
+                checked = engine?.palmRejection ?: settings.palmRejection
             ) {
                 settings.updatePalmRejection(it)
-                engine.palmRejection = it
+                engine?.palmRejection = it
             }
 
             ToggleRow(
                 title = "Debug HUD",
                 subtitle = "On-canvas pointer, pressure and performance info",
-                checked = settings.hudEnabled
+                checked = engine?.debugEnabled ?: settings.hudEnabled
             ) {
                 settings.updateHudEnabled(it)
-                engine.debugEnabled = it
+                engine?.debugEnabled = it
             }
 
             HorizontalDivider()
 
-            SectionTitle("About")
+            SectionTitle("New notebooks")
 
-            val context = LocalContext.current
-            val about = remember { buildAboutInfo(context) }
-            for (line in about) {
-                Text(line, style = MaterialTheme.typography.bodySmall)
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Default paper style", style = MaterialTheme.typography.labelLarge)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (paper in PageBackground.entries) {
+                        FilterChip(
+                            selected = settings.defaultPaper == paper,
+                            onClick = { settings.updateDefaultPaper(paper) },
+                            label = { Text(paper.displayName) }
+                        )
+                    }
+                }
             }
+
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Default notebook type", style = MaterialTheme.typography.labelLarge)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    for (m in PageMode.entries) {
+                        FilterChip(
+                            selected = settings.defaultPageMode == m,
+                            onClick = { settings.updateDefaultPageMode(m) },
+                            label = { Text(m.displayName) }
+                        )
+                    }
+                }
+            }
+
+            ToggleRow(
+                title = "Resume last notebook",
+                subtitle = "Open the last notebook you had open when starting ONote",
+                checked = settings.resumeLast
+            ) {
+                settings.updateResumeLast(it)
+            }
+
+            HorizontalDivider()
+
+            TextButton(onClick = { aboutOpen = true }) { Text("About ONote") }
         }
+    }
+
+    if (aboutOpen) {
+        AboutDialog(onDismiss = { aboutOpen = false })
     }
 }
 
@@ -136,25 +177,4 @@ private fun ToggleRow(
         Spacer(Modifier.size(8.dp))
         Switch(checked = checked, onCheckedChange = onChanged)
     }
-}
-
-private fun buildAboutInfo(context: Context): List<String> {
-    val pm = context.packageManager
-    val version = runCatching {
-        pm.getPackageInfo(
-            context.packageName,
-            PackageManager.PackageInfoFlags.of(0)
-        ).versionName
-    }.getOrDefault("?")
-    val hasPen = runCatching {
-        pm.hasSystemFeature("com.sec.feature.spen_usp") ||
-            pm.hasSystemFeature("android.hardware.stylus")
-    }.getOrDefault(false)
-    return listOf(
-        "oNote",
-        "Version $version (${context.packageName})",
-        "${Build.MANUFACTURER} ${Build.MODEL}",
-        "Android ${Build.VERSION.RELEASE} · SDK ${Build.VERSION.SDK_INT}",
-        "S Pen reported: $hasPen"
-    )
 }

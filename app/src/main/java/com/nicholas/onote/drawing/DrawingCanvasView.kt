@@ -10,7 +10,6 @@ import android.os.Build
 import android.view.MotionEvent
 import android.view.View
 import kotlin.math.floor
-import kotlin.math.max
 
 /**
  * The low-level drawing surface. Renders in document space under a
@@ -39,6 +38,11 @@ class DrawingCanvasView(
     }
 
     private val strokeFill = Paint().apply {
+        style = Paint.Style.FILL
+        isAntiAlias = true
+    }
+
+    private val highlightFill = Paint().apply {
         style = Paint.Style.FILL
         isAntiAlias = true
     }
@@ -85,10 +89,24 @@ class DrawingCanvasView(
         drawBackground(canvas, t)
 
         for (stroke in engine.strokes) {
-            StrokeRenderer.drawCompleted(stroke, canvas, strokeFill)
+            val fill = if (stroke.tool == Tool.HIGHLIGHTER) {
+                StrokeRenderer.prepareHighlightFill(highlightFill, engine.paperColor)
+                highlightFill
+            } else {
+                StrokeRenderer.prepareInkFill(strokeFill)
+                strokeFill
+            }
+            StrokeRenderer.drawCompleted(stroke, canvas, fill)
         }
-        engine.activeStroke?.let {
-            StrokeRenderer.drawActive(it, canvas, strokeFill, scratchPath)
+        engine.activeStroke?.let { active ->
+            val fill = if (active.tool == Tool.HIGHLIGHTER) {
+                StrokeRenderer.prepareHighlightFill(highlightFill, engine.paperColor)
+                highlightFill
+            } else {
+                StrokeRenderer.prepareInkFill(strokeFill)
+                strokeFill
+            }
+            StrokeRenderer.drawActive(active, canvas, fill, scratchPath)
         }
 
         canvas.restore()
@@ -108,12 +126,13 @@ class DrawingCanvasView(
 
         val paintColor = gridColor(engine.paperColor)
         gridPaint.color = paintColor
+        gridPaint.strokeWidth = 1f / t.zoom
         dotPaint.color = paintColor
 
-        // Grow the grid spacing at low zoom so we never draw an excessive
-        // number of elements per frame.
+        // Keep visible spacing roughly constant on screen so ruled/graph lines
+        // never thin out or disappear when zoomed far out.
         var step = gridStep
-        while (step * t.zoom < 12f) step += gridStep
+        while (step * t.zoom < 16f) step *= 2f
 
         when (engine.pageBackground) {
             PageBackground.BLANK -> {}
@@ -123,7 +142,7 @@ class DrawingCanvasView(
                 drawVerticalLines(canvas, left, right, top, bottom, step)
             }
             PageBackground.DOT -> {
-                val r = max(1f, 2f / t.zoom)
+                val r = 1.5f / t.zoom
                 var x = floor(left / step) * step
                 while (x <= right) {
                     var y = floor(top / step) * step

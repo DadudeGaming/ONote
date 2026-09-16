@@ -1,0 +1,712 @@
+package com.nicholas.onote.ui
+
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import com.nicholas.onote.data.NoteDocument
+import com.nicholas.onote.data.NotePage
+import com.nicholas.onote.data.PageMode
+import com.nicholas.onote.data.PageSource
+import com.nicholas.onote.drawing.DrawingCanvasView
+import com.nicholas.onote.drawing.DrawingEngine
+import com.nicholas.onote.drawing.PageBackground
+import com.nicholas.onote.drawing.ToolMode
+import com.nicholas.onote.settings.AppSettings
+import com.nicholas.onote.settings.PenSlot
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import java.util.UUID
+
+/**
+ * One open notebook: the persisted document plus the live drawing engine that
+ * is (re)hydrated from it, and, for Pages notebooks, the page being edited.
+ */
+class OpenNotebook(val doc: NoteDocument) {
+    var currentPageIndex by mutableStateOf(0)
+    val engine = DrawingEngine()
+
+    init {
+        engine.applyDocument(doc.sourceForPage(0))
+    }
+
+    fun source(): PageSource = doc.sourceForPage(currentPageIndex)
+}
+
+@Composable
+fun EditorScreen(
+    notebook: OpenNotebook,
+    openNotebooks: List<OpenNotebook>,
+    activeIndex: Int,
+    settings: AppSettings,
+    darkTheme: Boolean,
+    onSelectTab: (Int) -> Unit,
+    onCloseTab: (Int) -> Unit,
+    onNewTab: () -> Unit,
+    onHome: () -> Unit,
+    onSave: (OpenNotebook) -> Unit,
+    onOpenSettings: () -> Unit,
+    onDelete: () -> Unit,
+    onRenamed: (String) -> Unit
+) {
+    val engine = notebook.engine
+    var canvasView by remember { mutableStateOf<DrawingCanvasView?>(null) }
+    var penDialogIndex by remember { mutableStateOf(-1) }
+    var eraserDialogOpen by remember { mutableStateOf(false) }
+    var paperMenuOpen by remember { mutableStateOf(false) }
+    var moreMenuOpen by remember { mutableStateOf(false) }
+    var renameDialogOpen by remember { mutableStateOf(false) }
+    var deleteDialogOpen by remember { mutableStateOf(false) }
+    var deletePageDialogOpen by remember { mutableStateOf(false) }
+    var addPageDialogOpen by remember { mutableStateOf(false) }
+
+    val pagesMode = notebook.doc.pageMode == PageMode.PAGES
+
+    // Apply the themed paper colour synchronously so the canvas never has a
+    // white first frame in dark mode.
+    engine.paperColor = if (darkTheme) AppSettings.PaperDark else AppSettings.PaperLight
+
+    fun invalidate() = canvasView?.invalidate()
+
+    fun switchPage(to: Int) {
+        if (notebook.doc.pages.isEmpty()) return
+        val clamped = to.coerceIn(0, notebook.doc.pages.lastIndex)
+        if (clamped == notebook.currentPageIndex) return
+        onSave(notebook)
+        notebook.currentPageIndex = clamped
+        engine.applyDocument(notebook.source())
+        invalidate()
+    }
+
+    fun addPage(background: PageBackground) {
+        onSave(notebook)
+        notebook.doc.pages.add(NotePage(UUID.randomUUID().toString(), background))
+        notebook.currentPageIndex = notebook.doc.pages.lastIndex
+        engine.applyDocument(notebook.source())
+        invalidate()
+    }
+
+    fun deleteCurrentPage() {
+        if (notebook.doc.pages.size <= 1) return
+        onSave(notebook)
+        notebook.doc.pages.removeAt(notebook.currentPageIndex)
+        notebook.currentPageIndex = notebook.currentPageIndex.coerceIn(0, notebook.doc.pages.lastIndex)
+        engine.applyDocument(notebook.source())
+        invalidate()
+    }
+
+    // Debounced save whenever the page content changes.
+    LaunchedEffect(notebook.doc.id) {
+        val scope = this
+        var job: Job? = null
+        engine.onChanged = {
+            job?.cancel()
+            job = scope.launch {
+                delay(700)
+                onSave(notebook)
+            }
+        }
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        TabStrip(
+            openNotebooks = openNotebooks,
+            activeIndex = activeIndex,
+            onSelect = onSelectTab,
+            onClose = onCloseTab,
+            onNew = onNewTab,
+            onHome = onHome
+        )
+
+        Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
+            key(notebook.doc.id) {
+                AndroidView(
+                    factory = { context -> DrawingCanvasView(context, engine) },
+                    update = { view -> canvasView = view },
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            LandingIsland(
+                engine = engine,
+                settings = settings,
+                canUndo = engine.canUndo,
+                canRedo = engine.canRedo,
+                onUndo = { engine.undo(); invalidate() },
+                onRedo = { engine.redo(); invalidate() },
+                onSelectSlot = { i ->
+                    val slot = settings.slot(i)
+                    engine.activeColor = slot.color
+                    engine.activeWidth = slot.width
+                    engine.activeTool = slot.tool
+                    engine.toolMode = ToolMode.PEN
+                    settings.updateSelectedSlot(i)
+                },
+                onEditSlot = { i -> penDialogIndex = i },
+                onToggleEraser = {
+                    if (engine.toolMode == ToolMode.ERASER) eraserDialogOpen = true
+                    else {
+                        engine.toolMode = ToolMode.ERASER
+                        invalidate()
+                    }
+                },
+                onSetPaper = {
+                    engine.pageBackground = it
+                    invalidate()
+                    onSave(notebook)
+                },
+                paperMenuOpen = paperMenuOpen,
+                onPaperMenu = { paperMenuOpen = it },
+                moreMenuOpen = moreMenuOpen,
+                onMoreMenu = { moreMenuOpen = it },
+                pagesMode = pagesMode,
+                onSettings = onOpenSettings,
+                onRename = { renameDialogOpen = true },
+                onDelete = { deleteDialogOpen = true },
+                onTogglePalm = {
+                    engine.palmRejection = !engine.palmRejection
+                    settings.updatePalmRejection(engine.palmRejection)
+                    invalidate()
+                },
+                onToggleHud = {
+                    engine.debugEnabled = !engine.debugEnabled
+                    settings.updateHudEnabled(engine.debugEnabled)
+                    invalidate()
+                }
+            )
+
+            if (pagesMode) {
+                PageBar(
+                    currentPage = notebook.currentPageIndex + 1,
+                    total = notebook.doc.pages.size,
+                    onPrev = { switchPage(notebook.currentPageIndex - 1) },
+                    onNext = { switchPage(notebook.currentPageIndex + 1) },
+                    onAdd = { addPageDialogOpen = true },
+                    onDelete = { deletePageDialogOpen = true }
+                )
+            }
+        }
+    }
+
+    if (penDialogIndex >= 0) {
+        PenSlotDialog(
+            index = penDialogIndex,
+            slot = settings.slot(penDialogIndex),
+            onDismiss = { penDialogIndex = -1 }
+        ) { updated ->
+            settings.updatePenSlot(penDialogIndex, updated)
+            if (penDialogIndex == settings.selectedSlot && engine.toolMode == ToolMode.PEN) {
+                engine.activeColor = updated.color
+                engine.activeWidth = updated.width
+                engine.activeTool = updated.tool
+            }
+            penDialogIndex = -1
+        }
+    }
+
+    if (eraserDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { eraserDialogOpen = false },
+            title = { Text("Eraser size") },
+            text = {
+                Column {
+                    Text("${settings.eraserRadius.toInt()}px", style = MaterialTheme.typography.labelMedium)
+                    Slider(
+                        value = settings.eraserRadius,
+                        onValueChange = {
+                            settings.updateEraserRadius(it)
+                            engine.eraseRadius = it
+                        },
+                        valueRange = 10f..60f
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { eraserDialogOpen = false }) { Text("Done") }
+            }
+        )
+    }
+
+    if (renameDialogOpen) {
+        RenameDialog(
+            current = notebook.doc.title,
+            onDismiss = { renameDialogOpen = false },
+            onRename = {
+                onRenamed(it)
+                renameDialogOpen = false
+            }
+        )
+    }
+
+    if (deleteDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { deleteDialogOpen = false },
+            title = { Text("Move to trash?") },
+            text = { Text("\"${notebook.doc.title}\" will move to the trash. You can restore it from Home.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    deleteDialogOpen = false
+                    onDelete()
+                }) { Text("Move to trash") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteDialogOpen = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (addPageDialogOpen) {
+        AddPageDialog(
+            onDismiss = { addPageDialogOpen = false },
+            onAdd = {
+                addPage(it)
+                addPageDialogOpen = false
+            }
+        )
+    }
+
+    if (deletePageDialogOpen) {
+        AlertDialog(
+            onDismissRequest = { deletePageDialogOpen = false },
+            title = { Text("Delete this page?") },
+            text = {
+                Text(if (notebook.doc.pages.size <= 1) "A notebook needs at least one page."
+                else "Page ${notebook.currentPageIndex + 1} will be deleted.")
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        deletePageDialogOpen = false
+                        deleteCurrentPage()
+                    },
+                    enabled = notebook.doc.pages.size > 1
+                ) { Text("Delete") }
+            },
+            dismissButton = {
+                TextButton(onClick = { deletePageDialogOpen = false }) { Text("Cancel") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun TabStrip(
+    openNotebooks: List<OpenNotebook>,
+    activeIndex: Int,
+    onSelect: (Int) -> Unit,
+    onClose: (Int) -> Unit,
+    onNew: () -> Unit,
+    onHome: () -> Unit
+) {
+    Column(modifier = Modifier
+        .fillMaxWidth()
+        .background(MaterialTheme.colorScheme.surfaceVariant)) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .statusBarsPadding()
+                .height(44.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(onClick = onHome, modifier = Modifier.size(42.dp)) {
+                Icon(ONoteIcons.Home, contentDescription = "All notebooks")
+            }
+            Row(
+                modifier = Modifier
+                    .weight(1f)
+                    .horizontalScroll(rememberScrollState()),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                for ((i, nb) in openNotebooks.withIndex()) {
+                    TabChip(
+                        title = nb.doc.title,
+                        selected = i == activeIndex,
+                        showClose = openNotebooks.size > 1,
+                        onClick = { onSelect(i) },
+                        onClose = { onClose(i) }
+                    )
+                }
+            }
+            IconButton(onClick = onNew, modifier = Modifier.size(42.dp)) {
+                Icon(ONoteIcons.Plus, contentDescription = "New notebook")
+            }
+        }
+    }
+}
+
+@Composable
+private fun TabChip(
+    title: String,
+    selected: Boolean,
+    showClose: Boolean,
+    onClick: () -> Unit,
+    onClose: () -> Unit
+) {
+    val bg = if (selected) MaterialTheme.colorScheme.primaryContainer
+    else Color.Transparent
+    val content = if (selected) MaterialTheme.colorScheme.onPrimaryContainer
+    else MaterialTheme.colorScheme.onSurfaceVariant
+    Row(
+        modifier = Modifier
+            .padding(vertical = 4.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(bg)
+            .clickable(onClick = onClick)
+            .padding(start = 10.dp, end = if (showClose) 2.dp else 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            title,
+            color = content,
+            style = MaterialTheme.typography.labelLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.width(110.dp)
+        )
+        if (showClose) {
+            IconButton(
+                onClick = onClose,
+                modifier = Modifier.size(34.dp)
+            ) {
+                Icon(
+                    ONoteIcons.Close,
+                    contentDescription = "Close",
+                    tint = content,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
+}
+
+/**
+ * The compact floating toolbar, pinned near the top of the page so the whole
+ * lower area feels like writing space.
+ */
+@Composable
+private fun LandingIsland(
+    engine: DrawingEngine,
+    settings: AppSettings,
+    canUndo: Boolean,
+    canRedo: Boolean,
+    onUndo: () -> Unit,
+    onRedo: () -> Unit,
+    onSelectSlot: (Int) -> Unit,
+    onEditSlot: (Int) -> Unit,
+    onToggleEraser: () -> Unit,
+    onSetPaper: (PageBackground) -> Unit,
+    paperMenuOpen: Boolean,
+    onPaperMenu: (Boolean) -> Unit,
+    moreMenuOpen: Boolean,
+    onMoreMenu: (Boolean) -> Unit,
+    pagesMode: Boolean,
+    onSettings: () -> Unit,
+    onRename: () -> Unit,
+    onDelete: () -> Unit,
+    onTogglePalm: () -> Unit,
+    onToggleHud: () -> Unit
+) {
+    val auf = MaterialTheme.colorScheme.onSurfaceVariant
+    val eraserActive = engine.toolMode == ToolMode.ERASER
+
+    Box(
+        modifier = Modifier.fillMaxSize(),
+        contentAlignment = Alignment.TopCenter
+    ) {
+        Surface(
+            modifier = Modifier.padding(top = 10.dp),
+            shape = RoundedCornerShape(24.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 4.dp,
+            shadowElevation = 3.dp
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                for (i in 0 until 6) {
+                    val slot = settings.slot(i)
+                    val selected = settings.selectedSlot == i && engine.toolMode == ToolMode.PEN
+                    PenSlotDot(
+                        slot = slot,
+                        selected = selected,
+                        onClick = { if (selected) onEditSlot(i) else onSelectSlot(i) }
+                    )
+                }
+
+                IslandDivider()
+                IconButton(onClick = onToggleEraser, modifier = Modifier.size(32.dp)) {
+                    Icon(
+                        ONoteIcons.Eraser,
+                        contentDescription = "Eraser",
+                        tint = if (eraserActive) MaterialTheme.colorScheme.primary else auf,
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+
+                IslandDivider()
+                IconButton(onClick = onUndo, enabled = canUndo, modifier = Modifier.size(32.dp)) {
+                    Icon(ONoteIcons.UndoArrow, contentDescription = "Undo", modifier = Modifier.size(22.dp))
+                }
+                IconButton(onClick = onRedo, enabled = canRedo, modifier = Modifier.size(32.dp)) {
+                    Icon(ONoteIcons.RedoArrow, contentDescription = "Redo", modifier = Modifier.size(22.dp))
+                }
+
+                if (!pagesMode) {
+                    IslandDivider()
+                    Box {
+                        IconButton(onClick = { onPaperMenu(true) }, modifier = Modifier.size(32.dp)) {
+                            Icon(ONoteIcons.Page, contentDescription = "Paper", modifier = Modifier.size(22.dp))
+                        }
+                        DropdownMenu(expanded = paperMenuOpen, onDismissRequest = { onPaperMenu(false) }) {
+                            for (bg in PageBackground.entries) {
+                                DropdownMenuItem(
+                                    text = { Text(bg.displayName) },
+                                    onClick = {
+                                        onPaperMenu(false)
+                                        onSetPaper(bg)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                IslandDivider()
+                Box {
+                    IconButton(onClick = { onMoreMenu(true) }, modifier = Modifier.size(32.dp)) {
+                        Icon(ONoteIcons.MoreVert, contentDescription = "More actions", modifier = Modifier.size(22.dp))
+                    }
+                    DropdownMenu(expanded = moreMenuOpen, onDismissRequest = { onMoreMenu(false) }) {
+                        DropdownMenuItem(
+                            text = { Text(if (engine.palmRejection) "Turn palm rejection off" else "Turn palm rejection on") },
+                            onClick = {
+                                onMoreMenu(false)
+                                onTogglePalm()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (engine.debugEnabled) "Hide debug HUD" else "Show debug HUD") },
+                            onClick = {
+                                onMoreMenu(false)
+                                onToggleHud()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Rename") },
+                            onClick = {
+                                onMoreMenu(false)
+                                onRename()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Settings") },
+                            onClick = {
+                                onMoreMenu(false)
+                                onSettings()
+                            }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Move to trash") },
+                            onClick = {
+                                onMoreMenu(false)
+                                onDelete()
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PenSlotDot(slot: PenSlot, selected: Boolean, onClick: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .size(30.dp)
+            .clip(CircleShape)
+            .background(MaterialTheme.colorScheme.surface)
+            .border(
+                width = if (selected) 3.dp else 1.dp,
+                color = if (selected) MaterialTheme.colorScheme.primary
+                else MaterialTheme.colorScheme.outlineVariant,
+                shape = CircleShape
+            )
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Icon(
+            ONoteIcons.Pen,
+            contentDescription = slot.tool.displayName,
+            tint = Color(slot.color),
+            modifier = Modifier.size(18.dp)
+        )
+    }
+}
+
+/**
+ * Floating page navigator for "Pages" notebooks: previous/next, add a page,
+ * delete the current page.
+ */
+@Composable
+private fun PageBar(
+    currentPage: Int,
+    total: Int,
+    onPrev: () -> Unit,
+    onNext: () -> Unit,
+    onAdd: () -> Unit,
+    onDelete: () -> Unit
+) {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
+        Surface(
+            modifier = Modifier.padding(bottom = 14.dp),
+            shape = RoundedCornerShape(22.dp),
+            color = MaterialTheme.colorScheme.surface,
+            tonalElevation = 4.dp,
+            shadowElevation = 3.dp
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                IconButton(onClick = onPrev, enabled = currentPage > 1, modifier = Modifier.size(40.dp)) {
+                    Icon(ONoteIcons.ChevronLeft, contentDescription = "Previous page", modifier = Modifier.size(24.dp))
+                }
+                Text(
+                    "$currentPage / $total",
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.padding(horizontal = 4.dp)
+                )
+                IconButton(onClick = onNext, enabled = currentPage < total, modifier = Modifier.size(40.dp)) {
+                    Icon(ONoteIcons.ChevronRight, contentDescription = "Next page", modifier = Modifier.size(24.dp))
+                }
+                IslandDivider()
+                IconButton(onClick = onAdd, modifier = Modifier.size(40.dp)) {
+                    Icon(ONoteIcons.Plus, contentDescription = "Add page", modifier = Modifier.size(24.dp))
+                }
+                IconButton(onClick = onDelete, enabled = total > 1, modifier = Modifier.size(40.dp)) {
+                    Icon(ONoteIcons.Trash, contentDescription = "Delete page", modifier = Modifier.size(22.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun IslandDivider() {
+    Box(
+        modifier = Modifier
+            .width(1.dp)
+            .height(20.dp)
+            .background(MaterialTheme.colorScheme.outlineVariant)
+    )
+}
+
+@Composable
+private fun RenameDialog(
+    current: String,
+    onDismiss: () -> Unit,
+    onRename: (String) -> Unit
+) {
+    var text by remember { mutableStateOf(current) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Rename notebook") },
+        text = {
+            OutlinedTextField(
+                value = text,
+                onValueChange = { text = it },
+                singleLine = true
+            )
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { if (text.isNotBlank()) onRename(text.trim()) },
+                enabled = text.isNotBlank()
+            ) { Text("Rename") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+@Composable
+private fun AddPageDialog(
+    onDismiss: () -> Unit,
+    onAdd: (PageBackground) -> Unit
+) {
+    var bg by remember { mutableStateOf(PageBackground.RULED) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New page") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Paper style", style = MaterialTheme.typography.labelMedium)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    for (paper in PageBackground.entries) {
+                        TextButton(
+                            onClick = { bg = paper },
+                            colors = androidx.compose.material3.ButtonDefaults.textButtonColors(
+                                containerColor = if (bg == paper) MaterialTheme.colorScheme.primaryContainer
+                                else MaterialTheme.colorScheme.surfaceVariant
+                            )
+                        ) {
+                            Text(paper.displayName, style = MaterialTheme.typography.labelMedium)
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { onAdd(bg) }) { Text("Add page") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}

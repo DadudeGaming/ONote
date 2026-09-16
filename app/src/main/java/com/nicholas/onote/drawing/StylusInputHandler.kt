@@ -29,6 +29,13 @@ class StylusInputHandler(
     var mode = Mode.IDLE
         private set
 
+    /**
+     * True while the S Pen side button is held with the tool on a pen:
+     * "hold button -> temporarily erase, release -> back to pen".
+     */
+    var tempEraser = false
+        private set
+
     // Gesture anchors captured when the gesture begins.
     private var startFocalX = 0f
     private var startFocalY = 0f
@@ -102,7 +109,7 @@ class StylusInputHandler(
                 val t = engine.transform
                 val x = t.screenToDocX(event.getX(idx))
                 val y = t.screenToDocY(event.getY(idx))
-                if (engine.toolMode == ToolMode.ERASER) {
+                if (erasing(event)) {
                     engine.addErasePoint(x, y)
                 } else {
                     engine.addPoint(x, y, event.getPressure(idx), event.eventTime)
@@ -140,7 +147,7 @@ class StylusInputHandler(
 
     private fun finishTool(cancelled: Boolean) {
         if (strokePointerId < 0) return
-        val eraser = engine.toolMode == ToolMode.ERASER
+        val eraser = erasing(null)
         if (cancelled) {
             if (eraser) engine.cancelErase() else engine.cancelStroke()
         } else {
@@ -149,9 +156,25 @@ class StylusInputHandler(
         if (eraser) {
             Log.d(TAG, "erase end strokesRemovedRemaining=${engine.strokeCount}")
         }
+        tempEraser = false
         strokePointerId = -1
         mode = Mode.IDLE
     }
+
+    /** True if the current stroke should erase (tool is eraser, or button held). */
+    private fun erasing(event: MotionEvent?): Boolean {
+        if (engine.toolMode == ToolMode.ERASER) return true
+        if (tempEraser) return true
+        if (event != null && stylusButtonHeld(event)) {
+            tempEraser = true
+            return true
+        }
+        return false
+    }
+
+    private fun stylusButtonHeld(event: MotionEvent): Boolean =
+        event.isButtonPressed(MotionEvent.BUTTON_STYLUS_PRIMARY) ||
+            (event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY) != 0
 
     private fun beginStroke(event: MotionEvent, idx: Int) {
         strokePointerId = event.getPointerId(idx)
@@ -159,7 +182,7 @@ class StylusInputHandler(
         val t = engine.transform
         val x = t.screenToDocX(event.getX(idx))
         val y = t.screenToDocY(event.getY(idx))
-        if (engine.toolMode == ToolMode.ERASER) {
+        if (erasing(event)) {
             engine.beginErase()
             engine.addErasePoint(x, y)
         } else {
@@ -168,7 +191,8 @@ class StylusInputHandler(
         Log.d(
             TAG,
             "tool start mode=${engine.toolMode.name} tool=${toolName(event.getToolType(idx))} " +
-                "p=${String.format("%.2f", event.getPressure(idx))}"
+                "p=${String.format("%.2f", event.getPressure(idx))}" +
+                if (tempEraser) " buttonEraser" else ""
         )
     }
 

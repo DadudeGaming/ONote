@@ -3,6 +3,8 @@ package com.nicholas.onote.drawing
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
 import kotlin.math.hypot
 
 /**
@@ -11,6 +13,26 @@ import kotlin.math.hypot
  * S Pen pressure.
  */
 object StrokeRenderer {
+
+    private val highlightScreen = PorterDuffXfermode(PorterDuff.Mode.SCREEN)
+    private val highlightMultiply = PorterDuffXfermode(PorterDuff.Mode.MULTIPLY)
+
+    /** Prepares [fill] for a highlighter stroke on the given [paper] colour. */
+    fun prepareHighlightFill(fill: Paint, paper: Int) {
+        fill.xfermode = if (paperDark(paper)) highlightScreen else highlightMultiply
+    }
+
+    /** Prepares [fill] for an ordinary ink stroke. */
+    fun prepareInkFill(fill: Paint) {
+        fill.xfermode = null
+    }
+
+    fun paperDark(paper: Int): Boolean {
+        val r = (paper shr 16) and 0xFF
+        val g = (paper shr 8) and 0xFF
+        val b = paper and 0xFF
+        return 0.299f * r + 0.587f * g + 0.114f * b < 128f
+    }
 
     class Ribbon(
         val path: Path,
@@ -76,7 +98,7 @@ object StrokeRenderer {
     }
 
     fun drawCompleted(stroke: CompletedStroke, canvas: Canvas, fill: Paint) {
-        fill.color = stroke.color
+        fill.color = if (stroke.tool == Tool.HIGHLIGHTER) highlightTint(stroke.color) else stroke.color
         canvas.drawPath(stroke.ribbon.path, fill)
         stroke.ribbon.startDot?.let {
             canvas.drawCircle(it.x, it.y, it.radius, fill)
@@ -93,7 +115,7 @@ object StrokeRenderer {
         scratchPath: Path
     ) {
         val ribbon = buildRibbon(stroke.points, stroke.baseWidth)
-        fillPaint.color = stroke.color
+        fillPaint.color = if (stroke.tool == Tool.HIGHLIGHTER) highlightTint(stroke.color) else stroke.color
         canvas.drawPath(ribbon.path, fillPaint)
         ribbon.startDot?.let {
             canvas.drawCircle(it.x, it.y, it.radius, fillPaint)
@@ -102,6 +124,12 @@ object StrokeRenderer {
             canvas.drawCircle(it.x, it.y, it.radius, fillPaint)
         }
     }
+
+    /** Highlighter ink is drawn translucent so strokes beneath stay readable. */
+    fun highlightTint(color: Int): Int =
+        (color and 0x00FFFFFF) or (HIGHLIGHTER_ALPHA shl 24)
+
+    const val HIGHLIGHTER_ALPHA = 0x66
 
     private fun tangent(x0: Float, y0: Float, x1: Float, y1: Float): Pair<Float, Float> {
         val dx = x1 - x0

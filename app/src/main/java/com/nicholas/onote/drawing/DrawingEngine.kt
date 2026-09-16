@@ -3,6 +3,7 @@ package com.nicholas.onote.drawing
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.nicholas.onote.data.PageSource
 
 /**
  * Holds all drawing state: the in-progress stroke, finalized strokes, a
@@ -46,6 +47,29 @@ class DrawingEngine {
     var isErasing = false
         private set
 
+    /** Invoked whenever the page content changes (stroke added/erased/cleared). */
+    var onChanged: () -> Unit = {}
+
+    /** Replaces this engine's page with [source]'s strokes, paper and camera. */
+    fun applyDocument(source: PageSource) {
+        _strokes.clear()
+        _strokes.addAll(source.strokes)
+        pageBackground = source.pageBackground
+        transform.apply(source.cameraZoom, source.cameraOffsetX, source.cameraOffsetY)
+        undoStack.clear()
+        redoStack.clear()
+    }
+
+    /** Copies the current page (strokes, paper, camera) back into [source]. */
+    fun snapshotTo(source: PageSource) {
+        source.strokes.clear()
+        source.strokes.addAll(_strokes)
+        source.pageBackground = pageBackground
+        source.cameraZoom = transform.zoom
+        source.cameraOffsetX = transform.offsetX
+        source.cameraOffsetY = transform.offsetY
+    }
+
     fun beginStroke(x: Float, y: Float, pressure: Float, timestamp: Long) {
         val stroke = ActiveStroke(activeColor, activeWidth, activeTool)
         stroke.points.add(StrokePoint(x, y, pressure, timestamp))
@@ -58,11 +82,13 @@ class DrawingEngine {
 
     fun endStroke() {
         val stroke = activeStroke ?: return
-        val completed = CompletedStroke(stroke.color, stroke.points, stroke.baseWidth)
+        val completed =
+            CompletedStroke(stroke.color, stroke.points, stroke.baseWidth, stroke.tool)
         _strokes.add(completed)
         undoStack.addLast(Edit.Add(completed))
         redoStack.clear()
         activeStroke = null
+        onChanged()
     }
 
     fun cancelStroke() {
@@ -105,6 +131,7 @@ class DrawingEngine {
             undoStack.addLast(Edit.Remove(pendingErase.toList()))
             redoStack.clear()
             pendingErase.clear()
+            onChanged()
         }
     }
 
@@ -119,6 +146,7 @@ class DrawingEngine {
             val edit = undoStack.removeLast()
             edit.revert(this)
             redoStack.addLast(edit)
+            onChanged()
         }
     }
 
@@ -128,6 +156,7 @@ class DrawingEngine {
             val edit = redoStack.removeLast()
             edit.apply(this)
             undoStack.addLast(edit)
+            onChanged()
         }
     }
 
@@ -137,6 +166,7 @@ class DrawingEngine {
         undoStack.addLast(Edit.Remove(_strokes.toList()))
         redoStack.clear()
         _strokes.clear()
+        onChanged()
     }
 
     private sealed class Edit {
