@@ -19,6 +19,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -40,10 +42,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.ui.platform.LocalContext
 import com.nicholas.onote.data.NoteDocument
 import com.nicholas.onote.data.NotePage
 import com.nicholas.onote.data.PageMode
@@ -52,6 +56,7 @@ import com.nicholas.onote.drawing.DrawingCanvasView
 import com.nicholas.onote.drawing.DrawingEngine
 import com.nicholas.onote.drawing.PageBackground
 import com.nicholas.onote.drawing.ToolMode
+import com.nicholas.onote.pdf.PdfExporter
 import com.nicholas.onote.settings.AppSettings
 import com.nicholas.onote.settings.PenSlot
 import kotlinx.coroutines.Job
@@ -68,6 +73,7 @@ class OpenNotebook(val doc: NoteDocument) {
     val engine = DrawingEngine()
 
     init {
+        engine.preserveCamera = doc.pageMode == PageMode.PAGES
         engine.applyDocument(doc.sourceForPage(0))
     }
 
@@ -98,24 +104,42 @@ fun EditorScreen(
     var moreMenuOpen by remember { mutableStateOf(false) }
     var renameDialogOpen by remember { mutableStateOf(false) }
     var deleteDialogOpen by remember { mutableStateOf(false) }
-    var deletePageDialogOpen by remember { mutableStateOf(false) }
     var addPageDialogOpen by remember { mutableStateOf(false) }
+    var pageMenuFor by remember { mutableStateOf<Int?>(null) }
+    var pageRenameFor by remember { mutableStateOf<Int?>(null) }
+    var deleteTargetPage by remember { mutableStateOf<Int?>(null) }
 
     val pagesMode = notebook.doc.pageMode == PageMode.PAGES
+
+    val context = LocalContext.current
+    val exportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/pdf")
+    ) { uri ->
+        if (uri != null) {
+            onSave(notebook)
+            PdfExporter.export(context.contentResolver, uri, notebook.doc)
+        }
+    }
 
     // Apply the themed paper colour synchronously so the canvas never has a
     // white first frame in dark mode.
     engine.paperColor = if (darkTheme) AppSettings.PaperDark else AppSettings.PaperLight
+    engine.deskColor = if (darkTheme) AppSettings.DeskDark else AppSettings.DeskLight
 
     fun invalidate() = canvasView?.invalidate()
 
-    fun switchPage(to: Int) {
+    /** Switches the engine to another page, saving the current one first. */
+    fun changeActivePage(to: Int) {
         if (notebook.doc.pages.isEmpty()) return
         val clamped = to.coerceIn(0, notebook.doc.pages.lastIndex)
         if (clamped == notebook.currentPageIndex) return
         onSave(notebook)
         notebook.currentPageIndex = clamped
         engine.applyDocument(notebook.source())
+        if (pagesMode) {
+            canvasView?.setFlowPages(notebook.doc.pages, clamped)
+            canvasView?.scrollToPage(clamped)
+        }
         invalidate()
     }
 
@@ -124,15 +148,23 @@ fun EditorScreen(
         notebook.doc.pages.add(NotePage(UUID.randomUUID().toString(), background))
         notebook.currentPageIndex = notebook.doc.pages.lastIndex
         engine.applyDocument(notebook.source())
+        if (pagesMode) {
+            canvasView?.setFlowPages(notebook.doc.pages, notebook.currentPageIndex)
+            canvasView?.scrollToPage(notebook.currentPageIndex)
+        }
         invalidate()
     }
 
-    fun deleteCurrentPage() {
+    fun deletePageAt(index: Int) {
         if (notebook.doc.pages.size <= 1) return
         onSave(notebook)
-        notebook.doc.pages.removeAt(notebook.currentPageIndex)
+        notebook.doc.pages.removeAt(index)
         notebook.currentPageIndex = notebook.currentPageIndex.coerceIn(0, notebook.doc.pages.lastIndex)
         engine.applyDocument(notebook.source())
+        if (pagesMode) {
+            canvasView?.setFlowPages(notebook.doc.pages, notebook.currentPageIndex)
+            canvasView?.scrollToPage(notebook.currentPageIndex)
+        }
         invalidate()
     }
 
@@ -162,8 +194,37 @@ fun EditorScreen(
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             key(notebook.doc.id) {
                 AndroidView(
-                    factory = { context -> DrawingCanvasView(context, engine) },
-                    update = { view -> canvasView = view },
+                    factory = { context ->
+                        DrawingCanvasView(context, engine, pagesMode = pagesMode)
+                    },
+                    update = { view ->
+                        canvasView = view
+                        view.input.panEnabled = pagesMode && engine.palmRejection
+                        view.input.pageFlowEnabled = pagesMode
+                        view.input.pageCount = maxOf(1, notebook.doc.pages.size)
+                        view.input.flowIndex = notebook.currentPageIndex
+                        view.input.onDoubleTap2 = {
+                            engine.undo()
+                            invalidate()
+                            onSave(notebook)
+                        }
+                        view.input.onDoubleTap3 = {
+                            engine.redo()
+                            invalidate()
+                            onSave(notebook)
+                        }
+                        view.input.onActivePageChanged = { idx ->
+                            if (idx != notebook.currentPageIndex) changeActivePage(idx)
+                        }
+                        view.input.onLongPress3 = { idx ->
+                            engine.snapshotTo(notebook.source())
+                            onSave(notebook)
+                            pageMenuFor = idx
+                        }
+                        if (pagesMode) {
+                            view.setFlowPages(notebook.doc.pages, notebook.currentPageIndex)
+                        }
+                    },
                     modifier = Modifier.fillMaxSize()
                 )
             }
@@ -203,10 +264,13 @@ fun EditorScreen(
                 pagesMode = pagesMode,
                 onSettings = onOpenSettings,
                 onRename = { renameDialogOpen = true },
+                onAddPage = { addPageDialogOpen = true },
                 onDelete = { deleteDialogOpen = true },
+                onExport = { exportLauncher.launch(sanitizeFileName(notebook.doc.title) + ".pdf") },
                 onTogglePalm = {
                     engine.palmRejection = !engine.palmRejection
                     settings.updatePalmRejection(engine.palmRejection)
+                    canvasView?.input?.panEnabled = pagesMode && engine.palmRejection
                     invalidate()
                 },
                 onToggleHud = {
@@ -215,17 +279,6 @@ fun EditorScreen(
                     invalidate()
                 }
             )
-
-            if (pagesMode) {
-                PageBar(
-                    currentPage = notebook.currentPageIndex + 1,
-                    total = notebook.doc.pages.size,
-                    onPrev = { switchPage(notebook.currentPageIndex - 1) },
-                    onNext = { switchPage(notebook.currentPageIndex + 1) },
-                    onAdd = { addPageDialogOpen = true },
-                    onDelete = { deletePageDialogOpen = true }
-                )
-            }
         }
     }
 
@@ -270,6 +323,7 @@ fun EditorScreen(
 
     if (renameDialogOpen) {
         RenameDialog(
+            heading = "Rename notebook",
             current = notebook.doc.title,
             onDismiss = { renameDialogOpen = false },
             onRename = {
@@ -306,25 +360,68 @@ fun EditorScreen(
         )
     }
 
-    if (deletePageDialogOpen) {
+    val menuPage = pageMenuFor
+    if (menuPage != null && menuPage < notebook.doc.pages.size) {
         AlertDialog(
-            onDismissRequest = { deletePageDialogOpen = false },
-            title = { Text("Delete this page?") },
+            onDismissRequest = { pageMenuFor = null },
+            title = { Text("Page ${menuPage + 1}") },
+            text = {
+                Text(
+                    notebook.doc.pages[menuPage].title.ifBlank { "(untitled page)" },
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    pageRenameFor = menuPage
+                    pageMenuFor = null
+                }) { Text("Rename") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    deleteTargetPage = menuPage
+                    pageMenuFor = null
+                }) { Text("Delete") }
+            }
+        )
+    }
+
+    val renameFor = pageRenameFor
+    if (renameFor != null && renameFor < notebook.doc.pages.size) {
+        RenameDialog(
+            heading = "Rename page",
+            current = notebook.doc.pages[renameFor].title,
+            onDismiss = { pageRenameFor = null },
+            onRename = { newTitle ->
+                notebook.doc.pages[renameFor].title = newTitle
+                canvasView?.setFlowPages(notebook.doc.pages, notebook.currentPageIndex)
+                invalidate()
+                onSave(notebook)
+                pageRenameFor = null
+            }
+        )
+    }
+
+    val deletePage = deleteTargetPage
+    if (deletePage != null) {
+        AlertDialog(
+            onDismissRequest = { deleteTargetPage = null },
+            title = { Text("Delete page?") },
             text = {
                 Text(if (notebook.doc.pages.size <= 1) "A notebook needs at least one page."
-                else "Page ${notebook.currentPageIndex + 1} will be deleted.")
+                else "Page ${deletePage + 1} will be deleted.")
             },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        deletePageDialogOpen = false
-                        deleteCurrentPage()
+                        deleteTargetPage = null
+                        deletePageAt(deletePage)
                     },
                     enabled = notebook.doc.pages.size > 1
                 ) { Text("Delete") }
             },
             dismissButton = {
-                TextButton(onClick = { deletePageDialogOpen = false }) { Text("Cancel") }
+                TextButton(onClick = { deleteTargetPage = null }) { Text("Cancel") }
             }
         )
     }
@@ -350,7 +447,11 @@ private fun TabStrip(
             verticalAlignment = Alignment.CenterVertically
         ) {
             IconButton(onClick = onHome, modifier = Modifier.size(42.dp)) {
-                Icon(ONoteIcons.Home, contentDescription = "All notebooks")
+                Icon(
+                    ONoteIcons.Home,
+                    contentDescription = "All notebooks",
+                    tint = MaterialTheme.colorScheme.onSurface
+                )
             }
             Row(
                 modifier = Modifier
@@ -369,7 +470,11 @@ private fun TabStrip(
                 }
             }
             IconButton(onClick = onNew, modifier = Modifier.size(42.dp)) {
-                Icon(ONoteIcons.Plus, contentDescription = "New notebook")
+                Icon(
+                    ONoteIcons.Plus,
+                    contentDescription = "New notebook",
+                    tint = MaterialTheme.colorScheme.onSurface
+                )
             }
         }
     }
@@ -443,7 +548,9 @@ private fun LandingIsland(
     pagesMode: Boolean,
     onSettings: () -> Unit,
     onRename: () -> Unit,
+    onAddPage: () -> Unit,
     onDelete: () -> Unit,
+    onExport: () -> Unit,
     onTogglePalm: () -> Unit,
     onToggleHud: () -> Unit
 ) {
@@ -541,6 +648,22 @@ private fun LandingIsland(
                                 onRename()
                             }
                         )
+                        if (pagesMode) {
+                            DropdownMenuItem(
+                                text = { Text("Add page") },
+                                onClick = {
+                                    onMoreMenu(false)
+                                    onAddPage()
+                                }
+                            )
+                        }
+                        DropdownMenuItem(
+                            text = { Text("Export PDF") },
+                            onClick = {
+                                onMoreMenu(false)
+                                onExport()
+                            }
+                        )
                         DropdownMenuItem(
                             text = { Text("Settings") },
                             onClick = {
@@ -587,55 +710,6 @@ private fun PenSlotDot(slot: PenSlot, selected: Boolean, onClick: () -> Unit) {
     }
 }
 
-/**
- * Floating page navigator for "Pages" notebooks: previous/next, add a page,
- * delete the current page.
- */
-@Composable
-private fun PageBar(
-    currentPage: Int,
-    total: Int,
-    onPrev: () -> Unit,
-    onNext: () -> Unit,
-    onAdd: () -> Unit,
-    onDelete: () -> Unit
-) {
-    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.BottomCenter) {
-        Surface(
-            modifier = Modifier.padding(bottom = 14.dp),
-            shape = RoundedCornerShape(22.dp),
-            color = MaterialTheme.colorScheme.surface,
-            tonalElevation = 4.dp,
-            shadowElevation = 3.dp
-        ) {
-            Row(
-                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(2.dp)
-            ) {
-                IconButton(onClick = onPrev, enabled = currentPage > 1, modifier = Modifier.size(40.dp)) {
-                    Icon(ONoteIcons.ChevronLeft, contentDescription = "Previous page", modifier = Modifier.size(24.dp))
-                }
-                Text(
-                    "$currentPage / $total",
-                    style = MaterialTheme.typography.labelLarge,
-                    modifier = Modifier.padding(horizontal = 4.dp)
-                )
-                IconButton(onClick = onNext, enabled = currentPage < total, modifier = Modifier.size(40.dp)) {
-                    Icon(ONoteIcons.ChevronRight, contentDescription = "Next page", modifier = Modifier.size(24.dp))
-                }
-                IslandDivider()
-                IconButton(onClick = onAdd, modifier = Modifier.size(40.dp)) {
-                    Icon(ONoteIcons.Plus, contentDescription = "Add page", modifier = Modifier.size(24.dp))
-                }
-                IconButton(onClick = onDelete, enabled = total > 1, modifier = Modifier.size(40.dp)) {
-                    Icon(ONoteIcons.Trash, contentDescription = "Delete page", modifier = Modifier.size(22.dp))
-                }
-            }
-        }
-    }
-}
-
 @Composable
 private fun IslandDivider() {
     Box(
@@ -648,18 +722,26 @@ private fun IslandDivider() {
 
 @Composable
 private fun RenameDialog(
+    heading: String,
     current: String,
     onDismiss: () -> Unit,
     onRename: (String) -> Unit
 ) {
-    var text by remember { mutableStateOf(current) }
+    var text by remember(current) { mutableStateOf(current) }
+    var cleared by remember(current) { mutableStateOf(false) }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Rename notebook") },
+        title = { Text(heading) },
         text = {
             OutlinedTextField(
                 value = text,
                 onValueChange = { text = it },
+                modifier = Modifier.onFocusChanged { state ->
+                    if (state.isFocused && !cleared) {
+                        cleared = true
+                        text = ""
+                    }
+                },
                 singleLine = true
             )
         },
@@ -709,4 +791,9 @@ private fun AddPageDialog(
             TextButton(onClick = onDismiss) { Text("Cancel") }
         }
     )
+}
+
+private fun sanitizeFileName(title: String): String {
+    val clean = title.replace(Regex("[\\\\/:*?\"<>|]"), "_").trim()
+    return clean.ifBlank { "Notebook" }
 }

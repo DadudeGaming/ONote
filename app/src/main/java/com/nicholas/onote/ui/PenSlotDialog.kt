@@ -112,7 +112,7 @@ fun PenSlotDialog(
                     Slider(
                         value = width,
                         onValueChange = { width = it },
-                        valueRange = 1f..32f
+                        valueRange = 1f..80f
                     )
                 }
             }

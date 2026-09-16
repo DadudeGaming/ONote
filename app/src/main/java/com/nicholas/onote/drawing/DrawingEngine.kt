@@ -23,7 +23,17 @@ class DrawingEngine {
     var toolMode by mutableStateOf(ToolMode.PEN)
     var pageBackground by mutableStateOf(PageBackground.RULED)
     var paperColor: Int = 0xFFFFFFFF.toInt()
+
+    /** The desk surface surrounding the paper page in "Pages" mode. */
+    var deskColor: Int = 0xFF9A9A9A.toInt()
     var eraseRadius = 26f
+
+    /**
+     * When true ("Pages" notebooks running a vertically stacked flow), the
+     * shared camera transform is never replaced by [applyDocument]/[snapshotTo]
+     * — it belongs to the whole flow, not to individual pages.
+     */
+    var preserveCamera: Boolean = false
 
     // Pen appearance.
     var activeColor: Int = 0xFF1A1A1A.toInt()
@@ -55,7 +65,9 @@ class DrawingEngine {
         _strokes.clear()
         _strokes.addAll(source.strokes)
         pageBackground = source.pageBackground
-        transform.apply(source.cameraZoom, source.cameraOffsetX, source.cameraOffsetY)
+        if (!preserveCamera) {
+            transform.apply(source.cameraZoom, source.cameraOffsetX, source.cameraOffsetY)
+        }
         undoStack.clear()
         redoStack.clear()
     }
@@ -65,9 +77,11 @@ class DrawingEngine {
         source.strokes.clear()
         source.strokes.addAll(_strokes)
         source.pageBackground = pageBackground
-        source.cameraZoom = transform.zoom
-        source.cameraOffsetX = transform.offsetX
-        source.cameraOffsetY = transform.offsetY
+        if (!preserveCamera) {
+            source.cameraZoom = transform.zoom
+            source.cameraOffsetX = transform.offsetX
+            source.cameraOffsetY = transform.offsetY
+        }
     }
 
     fun beginStroke(x: Float, y: Float, pressure: Float, timestamp: Long) {

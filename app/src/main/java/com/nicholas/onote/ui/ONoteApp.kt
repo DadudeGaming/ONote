@@ -115,6 +115,8 @@ fun ONoteApp() {
             engine.activeTool = slot.tool
             engine.paperColor =
                 if (darkTheme) AppSettings.PaperDark else AppSettings.PaperLight
+            engine.deskColor =
+                if (darkTheme) AppSettings.DeskDark else AppSettings.DeskLight
             if (engine.toolMode != ToolMode.ERASER) {
                 val lum = luminance(engine.activeColor)
                 if (darkTheme && lum < 48) engine.activeColor = 0xFFEDEDED.toInt()

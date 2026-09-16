@@ -162,11 +162,15 @@ class AppSettings(context: Context) {
             PenSlot(Tool.BALLPOINT, 0xFFC62828.toInt(), 4f),
             PenSlot(Tool.BALLPOINT, 0xFF2E7D32.toInt(), 4f),
             PenSlot(Tool.PENCIL, 0xFF795548.toInt(), 3f),
-            PenSlot(Tool.HIGHLIGHTER, 0xFFFFD600.toInt(), 24f)
+            PenSlot(Tool.HIGHLIGHTER, 0xFFFFD600.toInt(), 40f)
         )
 
         /** Light/dark paper colour (dark is grey, not pure black). */
         const val PaperLight = 0xFFFFFFFF.toInt()
         const val PaperDark = 0xFF1E1E1F.toInt()
+
+        /** Desk surface around the paper page in "Pages" mode (darker than paper). */
+        const val DeskLight = 0xFF8A8A8A.toInt()
+        const val DeskDark = 0xFF0B0B0C.toInt()
     }
 }

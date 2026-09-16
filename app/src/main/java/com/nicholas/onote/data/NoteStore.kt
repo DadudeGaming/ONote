@@ -108,6 +108,7 @@ class NoteStore(context: Context) {
                     pageBackground = runCatching { PageBackground.valueOf(pj.getString("bg")) }
                         .getOrDefault(doc.pageBackground)
                 )
+                page.title = pj.optString("title", "")
                 applyCamera(pj.optJSONObject("camera"), page)
                 val sa = pj.optJSONArray("strokes") ?: JSONArray()
                 for (j in 0 until sa.length()) {
@@ -170,6 +171,7 @@ class NoteStore(context: Context) {
             val pj = JSONObject()
             pj.put("id", p.id)
             pj.put("bg", p.pageBackground.name)
+            if (p.title.isNotBlank()) pj.put("title", p.title)
             pj.put("camera", cameraJson(p))
             pj.put("strokes", strokesJson(p.strokes))
             pages.put(pj)
