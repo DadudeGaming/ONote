@@ -20,7 +20,7 @@ class StylusInputHandler(
     private val invalidate: () -> Unit
 ) {
 
-    enum class Mode { IDLE, STROKE, GESTURE }
+    enum class Mode { IDLE, TOOL, GESTURE }
 
     private val pointers = HashMap<Int, Int>() // pointerId -> toolType
 
@@ -99,9 +99,14 @@ class StylusInputHandler(
         if (strokePointerId >= 0) {
             val idx = event.findPointerIndex(strokePointerId)
             if (idx >= 0) {
-                engine.addPoint(
-                    event.getX(idx), event.getY(idx), event.getPressure(idx), event.eventTime
-                )
+                val t = engine.transform
+                val x = t.screenToDocX(event.getX(idx))
+                val y = t.screenToDocY(event.getY(idx))
+                if (engine.toolMode == ToolMode.ERASER) {
+                    engine.addErasePoint(x, y)
+                } else {
+                    engine.addPoint(x, y, event.getPressure(idx), event.eventTime)
+                }
             }
         }
         if (mode == Mode.GESTURE) {
@@ -115,39 +120,55 @@ class StylusInputHandler(
         val id = event.getPointerId(idx)
 
         if (id == strokePointerId) {
-            engine.endStroke()
-            strokePointerId = -1
+            finishTool(false)
         }
         pointers.remove(id)
 
         if (mode == Mode.GESTURE && touchPointerIds().size < 2) {
             mode = Mode.IDLE
         }
-        if (mode == Mode.STROKE && strokePointerId == -1) {
+        if (mode == Mode.TOOL && strokePointerId == -1) {
             mode = Mode.IDLE
         }
     }
 
     private fun onActionUp(event: MotionEvent, cancelled: Boolean) {
-        if (strokePointerId >= 0) {
-            if (cancelled) engine.cancelStroke() else engine.endStroke()
-            strokePointerId = -1
-        }
+        finishTool(cancelled)
         mode = Mode.IDLE
         pointers.clear()
     }
 
+    private fun finishTool(cancelled: Boolean) {
+        if (strokePointerId < 0) return
+        val eraser = engine.toolMode == ToolMode.ERASER
+        if (cancelled) {
+            if (eraser) engine.cancelErase() else engine.cancelStroke()
+        } else {
+            if (eraser) engine.endErase() else engine.endStroke()
+        }
+        if (eraser) {
+            Log.d(TAG, "erase end strokesRemovedRemaining=${engine.strokeCount}")
+        }
+        strokePointerId = -1
+        mode = Mode.IDLE
+    }
+
     private fun beginStroke(event: MotionEvent, idx: Int) {
         strokePointerId = event.getPointerId(idx)
-        mode = Mode.STROKE
-        engine.beginStroke(
-            event.getX(idx), event.getY(idx), event.getPressure(idx), event.eventTime
-        )
+        mode = Mode.TOOL
+        val t = engine.transform
+        val x = t.screenToDocX(event.getX(idx))
+        val y = t.screenToDocY(event.getY(idx))
+        if (engine.toolMode == ToolMode.ERASER) {
+            engine.beginErase()
+            engine.addErasePoint(x, y)
+        } else {
+            engine.beginStroke(x, y, event.getPressure(idx), event.eventTime)
+        }
         Log.d(
             TAG,
-            "stroke start tool=${toolName(event.getToolType(idx))} " +
-                "p=${String.format("%.2f", event.getPressure(idx))} " +
-                "t=${System.currentTimeMillis()}"
+            "tool start mode=${engine.toolMode.name} tool=${toolName(event.getToolType(idx))} " +
+                "p=${String.format("%.2f", event.getPressure(idx))}"
         )
     }
 

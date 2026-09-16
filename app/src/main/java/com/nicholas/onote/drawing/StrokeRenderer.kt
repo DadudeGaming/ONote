@@ -77,13 +77,11 @@ object StrokeRenderer {
 
     fun drawCompleted(stroke: CompletedStroke, canvas: Canvas, fill: Paint) {
         fill.color = stroke.color
-        canvas.drawPath(stroke.path, fill)
-        stroke.startDot?.let {
-            fill.color = stroke.color
+        canvas.drawPath(stroke.ribbon.path, fill)
+        stroke.ribbon.startDot?.let {
             canvas.drawCircle(it.x, it.y, it.radius, fill)
         }
-        stroke.endDot?.let {
-            fill.color = stroke.color
+        stroke.ribbon.endDot?.let {
             canvas.drawCircle(it.x, it.y, it.radius, fill)
         }
     }

@@ -10,15 +10,13 @@ import android.os.Build
 import android.view.MotionEvent
 import android.view.View
 import kotlin.math.floor
+import kotlin.math.max
 
 /**
  * The low-level drawing surface. Renders in document space under a
- * translate+scale transform, so strokes never change when the user pans/zooms.
- *
- * A custom [View] (rather than a Compose Canvas) is used on purpose: raw
- * [MotionEvent]s give us per-point pressure/tool/pointer info and let us
- * `invalidate()` without Compose recomposition, which is what keeps the pen
- * trail feeling immediate.
+ * translate+scale transform, so stroke coordinates never change when the user
+ * pans/zooms. Page appearance (paper color, ruled/graph/dot background) is
+ * drawn in the same document space so it stays glued to the page.
  */
 class DrawingCanvasView(
     context: Context,
@@ -27,16 +25,17 @@ class DrawingCanvasView(
 
     val input = StylusInputHandler(engine) { invalidate() }
 
-    private val pagePaint = Paint().apply {
-        style = Paint.Style.FILL
-        color = Color.WHITE
-    }
+    private val pagePaint = Paint().apply { style = Paint.Style.FILL }
 
     private val gridPaint = Paint().apply {
         style = Paint.Style.STROKE
-        color = 0xFFD6E6F5.toInt()
         strokeWidth = 1f
         isAntiAlias = false
+    }
+
+    private val dotPaint = Paint().apply {
+        style = Paint.Style.FILL
+        isAntiAlias = true
     }
 
     private val strokeFill = Paint().apply {
@@ -75,6 +74,7 @@ class DrawingCanvasView(
         val w = width.toFloat()
         val h = height.toFloat()
 
+        pagePaint.color = engine.paperColor
         canvas.drawRect(0f, 0f, w, h, pagePaint)
 
         val t = engine.transform
@@ -82,7 +82,7 @@ class DrawingCanvasView(
         canvas.translate(t.offsetX, t.offsetY)
         canvas.scale(t.zoom, t.zoom)
 
-        drawGrid(canvas, w, h)
+        drawBackground(canvas, t)
 
         for (stroke in engine.strokes) {
             StrokeRenderer.drawCompleted(stroke, canvas, strokeFill)
@@ -98,45 +98,96 @@ class DrawingCanvasView(
         }
     }
 
-    private fun drawGrid(canvas: Canvas, w: Float, h: Float) {
-        val t = engine.transform
-        val left = t.screenToDocX(0f)
-        val right = t.screenToDocX(w)
-        val top = t.screenToDocY(0f)
-        val bottom = t.screenToDocY(h)
+    private fun drawBackground(canvas: Canvas, t: CameraTransform) {
+        if (engine.pageBackground == PageBackground.BLANK) return
 
-        var x = floor(left / gridStep) * gridStep
-        while (x <= right) {
-            canvas.drawLine(x, top, x, bottom, gridPaint)
-            x += gridStep
+        val left = t.screenToDocX(0f)
+        val right = t.screenToDocX(width.toFloat())
+        val top = t.screenToDocY(0f)
+        val bottom = t.screenToDocY(height.toFloat())
+
+        val paintColor = gridColor(engine.paperColor)
+        gridPaint.color = paintColor
+        dotPaint.color = paintColor
+
+        // Grow the grid spacing at low zoom so we never draw an excessive
+        // number of elements per frame.
+        var step = gridStep
+        while (step * t.zoom < 12f) step += gridStep
+
+        when (engine.pageBackground) {
+            PageBackground.BLANK -> {}
+            PageBackground.RULED -> drawHorizontalLines(canvas, left, right, top, bottom, step)
+            PageBackground.GRAPH -> {
+                drawHorizontalLines(canvas, left, right, top, bottom, step)
+                drawVerticalLines(canvas, left, right, top, bottom, step)
+            }
+            PageBackground.DOT -> {
+                val r = max(1f, 2f / t.zoom)
+                var x = floor(left / step) * step
+                while (x <= right) {
+                    var y = floor(top / step) * step
+                    while (y <= bottom) {
+                        canvas.drawCircle(x, y, r, dotPaint)
+                        y += step
+                    }
+                    x += step
+                }
+            }
         }
-        var y = floor(top / gridStep) * gridStep
+    }
+
+    private fun drawHorizontalLines(
+        canvas: Canvas, left: Float, right: Float, top: Float, bottom: Float, step: Float
+    ) {
+        var y = floor(top / step) * step
         while (y <= bottom) {
             canvas.drawLine(left, y, right, y, gridPaint)
-            y += gridStep
+            y += step
         }
+    }
+
+    private fun drawVerticalLines(
+        canvas: Canvas, left: Float, right: Float, top: Float, bottom: Float, step: Float
+    ) {
+        var x = floor(left / step) * step
+        while (x <= right) {
+            canvas.drawLine(x, top, x, bottom, gridPaint)
+            x += step
+        }
+    }
+
+    private fun gridColor(paper: Int): Int {
+        val r = (paper shr 16) and 0xFF
+        val g = (paper shr 8) and 0xFF
+        val b = paper and 0xFF
+        val luminance = 0.299f * r + 0.587f * g + 0.114f * b
+        return if (luminance < 128f) 0xFF4A4A4A.toInt() else 0xFFD8E6F6.toInt()
     }
 
     private fun drawDebugHud(canvas: Canvas, w: Float, h: Float) {
         val t = engine.transform
         val active = engine.activeStroke
-        val mode = input.mode.name
         val lastP = active?.points?.lastOrNull()
-        val stylus = input.stylusPointersActive()
-        val touch = input.touchPointersActive()
-
+        val eraser = engine.toolMode == ToolMode.ERASER
+        val palmOff = engine.palmRejection == false
         val lines = listOf(
-            "${Build.MANUFACTURER.uppercase()} ${Build.MODEL} " +
-                "SDK ${Build.VERSION.SDK_INT} | ${width}x${height}px",
-            "mode=$mode | stylus ptrs=$stylus touch ptrs=$touch | palmRej=${engine.palmRejection}",
+            "${Build.MANUFACTURER.uppercase()} ${Build.MODEL} SDK ${Build.VERSION.SDK_INT}" +
+                " ${width}x${height}px",
+            "mode=${input.mode.name} tool=${engine.toolMode.name} bg=${engine.pageBackground.name}" +
+                if (eraser) " (radius=${engine.eraseRadius.toInt()})" else "",
+            "ptrs stylus=${input.stylusPointersActive()} touch=${input.touchPointersActive()}" +
+                " palm=${engine.palmRejection}",
             "strokes=${engine.strokeCount}" +
-                if (active != null) " +active(${active.points.size} pts)" else "",
-            "lastPt p=${lastP?.let { "%.2f".format(it.pressure) } ?: "--"} " +
-                "w=${StrokeRenderer.pressureWidth(engine.activeWidth, lastP?.pressure ?: 0f).let { "%.1f".format(it) }}",
+                if (engine.isErasing) " +erasing" else
+                    if (active != null) "+active(${active.points.size}pts)" else "",
+            "lastP p=${lastP?.let { "%.2f".format(it.pressure) } ?: "--"} " +
+                if (palmOff) "palmrej=OFF" else "",
             "zoom=${"%.2f".format(t.zoom)} off=(${"%.0f".format(t.offsetX)},${"%.0f".format(t.offsetY)})",
-            "events=${input.totalEvents} move=${input.moveEvents} " +
-                "avgMove=%.1fms".format(input.avgMoveIntervalMs),
-            "finger=${engine.activeWidth.toInt()}px ${engine.activeTool.name}"
+            "events=${input.totalEvents} move=${input.moveEvents}" +
+                " avgMove=%.1fms".format(input.avgMoveIntervalMs),
+            "pen ${engine.activeWidth.toInt()}px ${engine.activeTool.name} " +
+                "undo=${if (engine.canUndo) "Y" else "n"} redo=${if (engine.canRedo) "Y" else "n"}"
         )
 
         val lineHeight = hudPaint.fontSpacing

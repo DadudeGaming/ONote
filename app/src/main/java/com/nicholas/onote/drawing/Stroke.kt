@@ -10,6 +10,18 @@ enum class Tool {
     HIGHLIGHTER
 }
 
+enum class ToolMode(val displayName: String) {
+    PEN("Pen"),
+    ERASER("Eraser")
+}
+
+enum class PageBackground(val displayName: String) {
+    BLANK("Blank"),
+    RULED("Ruled"),
+    GRAPH("Graph"),
+    DOT("Dot Grid")
+}
+
 /**
  * A single sampled point of a stroke in document coordinates.
  */
@@ -39,12 +51,19 @@ class Dot(
 )
 
 /**
- * A finalized stroke with its ribbon path cached so redraws never recompute the
- * polygon. `startDot`/`endDot` are the round caps rendered as circles.
+ * A finalized stroke. [points] are kept (needed for erasing, selection,
+ * persistence) while [ribbon] caches the rendered polygon so redraws never
+ * recompute it.
  */
 class CompletedStroke(
     val color: Int,
-    val path: Path,
-    val startDot: Dot?,
-    val endDot: Dot?
-)
+    val points: ArrayList<StrokePoint>,
+    val baseWidth: Float
+) {
+    var ribbon: StrokeRenderer.Ribbon = StrokeRenderer.buildRibbon(points, baseWidth)
+        private set
+
+    fun rebuildRibbon() {
+        ribbon = StrokeRenderer.buildRibbon(points, baseWidth)
+    }
+}
