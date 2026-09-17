@@ -1,16 +1,23 @@
 package com.nicholas.onote.drawing
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.RectF
 import android.graphics.Typeface
 import android.os.Build
 import android.view.MotionEvent
 import android.view.View
 import com.nicholas.onote.data.NotePage
+import com.nicholas.onote.data.PlacedImage
 import com.nicholas.onote.data.PageFlow
+import java.io.File
 import kotlin.math.floor
+import kotlin.math.max
+import kotlin.math.min
 
 /**
  * The low-level drawing surface. Renders in document space under a
@@ -19,7 +26,8 @@ import kotlin.math.floor
  *
  * In **Pages** mode the notebook's pages are stacked vertically in document
  * space ([PageFlow]); each page is a fixed white paper surface on a darker
- * "desk" background, and the user scrolls down through them like a PDF.
+ * "desk" background, and the user scrolls through them like a PDF. Landscape
+ * and portrait pages mix freely, each centered on the stack's centre line.
  * Strokes are clipped to their page so the desk area cannot be written on.
  * Only the active page's engine content is rendered; other pages come straight
  * from their `NotePage` data.
@@ -43,6 +51,52 @@ class DrawingCanvasView(
 
     /** Index (into [flowPages]) whose strokes live in the engine. */
     var flowActiveIndex: Int = 0
+
+    /** Invoked when the user keeps scrolling past the last page (auto-add). */
+    var onRequestNewPage: (() -> Unit)? = null
+    private var pendingNewPage = false
+
+    /** Imported images for infinite notebooks (doc-space coords). */
+    var infiniteImages: List<PlacedImage> = emptyList()
+
+    /** Set by the editor while the user is placing/moving/resizing images. */
+    var imageToolActive = false
+
+    /** Invoked after an image is moved/resized/added/deleted (persist). */
+    var onImagesChanged: (() -> Unit)? = null
+    private var selectedImageId: String? = null
+
+    // Image placement gesture state.
+    private var imgDragImage: PlacedImage? = null
+    private var imgDragMode = 0          // 1 = move, 2 = resize, 3 = delete
+    private var imgStartX = 0f
+    private var imgStartY = 0f
+    private var imgOrigX = 0f
+    private var imgOrigY = 0f
+    private var imgOrigW = 0f
+    private var imgOrigH = 0f
+    private var imgMoved = false
+
+    private val bitmapCache = HashMap<String, Bitmap>()
+    private val imagePaint = Paint().apply { isFilterBitmap = true }
+    private val selectionPaint = Paint().apply {
+        style = Paint.Style.STROKE
+        strokeWidth = 3f
+        color = 0xFF1A73E8.toInt()
+    }
+    private val handlePaint = Paint().apply {
+        style = Paint.Style.FILL
+        color = 0xFF1A73E8.toInt()
+    }
+    private val deleteBadgePaint = Paint().apply {
+        style = Paint.Style.FILL
+        color = 0xFFD93025.toInt()
+    }
+    private val deleteBadgeTextPaint = Paint().apply {
+        isAntiAlias = true
+        color = 0xFFFFFFFF.toInt()
+        textAlign = Paint.Align.CENTER
+    }
 
     private val pagePaint = Paint().apply { style = Paint.Style.FILL }
 
@@ -100,6 +154,16 @@ class DrawingCanvasView(
 
     private val gridStep = 32f
 
+    /** Desk clearance at the top; 0 so a scrolled-up page is cut exactly at the
+     * bottom of the tab bar (the canvas starts right where the bar ends). */
+    private val topSlackPx: Float
+        get() = TOP_SLACK_DP * resources.displayMetrics.density
+    /** No bottom cutoff: the page stack may reach all the way to the bottom edge. */
+    private val bottomSlackPx: Float
+        get() = BOTTOM_SLACK_DP * resources.displayMetrics.density
+    private val marginPx: Float
+        get() = MARGIN_DP * resources.displayMetrics.density
+
     init {
         isClickable = true
         isFocusable = true
@@ -109,9 +173,183 @@ class DrawingCanvasView(
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
+        // While the image tool is on, let a finger directly select/move/resize/
+        // delete images. If the touch misses every image we deliberately don't
+        // consume it, so two-finger pan and pen drawing keep working.
+        if (imageToolActive && handleImageTouch(event)) return true
         input.handleEvent(event)
         return true
     }
+
+    // The pointer currently driving an image drag (finger or pen).
+    private var imgDragPointerId = -1
+
+    /** Selects / moves / resizes / deletes the image under the pointer. */
+    private fun handleImageTouch(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> {
+                if (imgDragImage != null) return true
+                val idx = event.actionIndex
+                val (px, py) = toPageXY(event.getX(idx), event.getY(idx))
+                val images = activeImages()
+                imgDragImage = null
+                imgDragMode = 0
+                imgMoved = false
+                for (im in images.asReversed()) {
+                    val right = im.x + im.w
+                    val bottom = im.y + im.h
+                    if (px in im.x..right && py in im.y..bottom) {
+                        imgDragImage = im
+                        imgDragPointerId = event.getPointerId(idx)
+                        imgStartX = px
+                        imgStartY = py
+                        imgOrigX = im.x
+                        imgOrigY = im.y
+                        imgOrigW = im.w
+                        imgOrigH = im.h
+                        val handle = imageHitPx / engine.transform.zoom
+                        imgDragMode = when {
+                            px > right - handle && py > bottom - handle -> 2   // resize corner
+                            px < im.x + handle && py < im.y + handle -> 3      // delete badge
+                            else -> 1                                           // move body
+                        }
+                        selectedImageId = im.id
+                        invalidate()
+                        return true
+                    }
+                }
+                return false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                val drag = imgDragImage ?: return false
+                val pi = event.findPointerIndex(imgDragPointerId)
+                if (pi < 0) return false
+                val (px, py) = toPageXY(event.getX(pi), event.getY(pi))
+                when (imgDragMode) {
+                    1 -> {
+                        val nx = imgOrigX + (px - imgStartX)
+                        val ny = imgOrigY + (py - imgStartY)
+                        drag.x = nx
+                        drag.y = ny
+                        imgMoved = true
+                        invalidate()
+                    }
+                    2 -> {
+                        val newW = max(MIN_IMAGE_SIZE, imgOrigW + (px - imgStartX))
+                        val newH = max(
+                            MIN_IMAGE_SIZE,
+                            imgOrigH + (newW - imgOrigW) * (imgOrigH / max(1f, imgOrigW))
+                        )
+                        drag.w = newW
+                        drag.h = max(MIN_IMAGE_SIZE, newH)
+                        imgMoved = true
+                        invalidate()
+                    }
+                }
+                return true
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (event.getPointerId(event.actionIndex) != imgDragPointerId) return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val drag = imgDragImage
+                if (drag != null) {
+                    if (imgDragMode == 3 && !imgMoved) {
+                        imagesList().remove(drag)
+                        selectedImageId = null
+                        bitmapCache.remove(drag.path)
+                        onImagesChanged?.invoke()
+                        invalidate()
+                    } else {
+                        onImagesChanged?.invoke()
+                    }
+                    imgDragImage = null
+                    imgDragMode = 0
+                    imgDragPointerId = -1
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /** Starts placing the given image (enters image tool mode). */
+    fun startPlacingImage(imageId: String) {
+        imageToolActive = true
+        selectedImageId = imageId
+        invalidate()
+    }
+
+    fun clearImageSelection() {
+        imageToolActive = false
+        selectedImageId = null
+        imgDragImage = null
+        imgDragMode = 0
+        imgDragPointerId = -1
+        invalidate()
+    }
+
+    private fun activeImages(): List<PlacedImage> =
+        if (pagesMode) flowPages.getOrNull(flowActiveIndex)?.images ?: emptyList()
+        else infiniteImages
+
+    private fun imagesList(): ArrayList<PlacedImage> =
+        if (pagesMode) flowPages.getOrNull(flowActiveIndex)?.images
+            as? ArrayList<PlacedImage> ?: infiniteImages as ArrayList<PlacedImage>
+        else (infiniteImages as ArrayList<PlacedImage>)
+
+    /** Screen -> page-local coordinates under the active page/flow. */
+    private fun toPageXY(screenX: Float, screenY: Float): Pair<Float, Float> {
+        val t = engine.transform
+        val docX = t.screenToDocX(screenX)
+        val docY = t.screenToDocY(screenY)
+        if (!pagesMode) return Pair(docX, docY)
+        val top = PageFlow.pageTop(flowActiveIndex, flowPages)
+        val page = flowPages.getOrNull(flowActiveIndex)
+        val left = if (page != null) (PageFlow.maxWidth(flowPages) - page.width) / 2f else 0f
+        return Pair(docX - left, docY - top)
+    }
+
+    private fun bitmapFor(path: String): Bitmap? {
+        bitmapCache[path]?.let { if (!it.isRecycled) return it }
+        val f = File(context.filesDir, path)
+        if (!f.isFile) return null
+        val bmp = BitmapFactory.decodeFile(f.absolutePath) ?: return null
+        bitmapCache[path] = bmp
+        return bmp
+    }
+
+    private fun drawImages(canvas: Canvas, images: List<PlacedImage>, pageX: Float, top: Float) {
+        if (images.isEmpty()) return
+        canvas.save()
+        canvas.translate(pageX, top)
+        val selected = selectedImageId
+        for (im in images) {
+            val bmp = bitmapFor(im.path) ?: continue
+            val right = im.x + im.w
+            val bottom = im.y + im.h
+            canvas.drawBitmap(bmp, null, RectF(im.x, im.y, right, bottom), imagePaint)
+            if (imageToolActive && im.id == selected) {
+                val draw = imageHandlePx / engine.transform.zoom
+                canvas.drawRect(im.x, im.y, right, bottom, selectionPaint)
+                canvas.drawCircle(right, bottom, draw, handlePaint)
+                val badgeR = draw * 1.8f
+                canvas.drawCircle(im.x, im.y, badgeR, deleteBadgePaint)
+                deleteBadgeTextPaint.textSize = badgeR * 1.4f
+                canvas.drawText(
+                    "×", im.x, im.y - (deleteBadgeTextPaint.fontMetrics.ascent + deleteBadgeTextPaint.fontMetrics.descent) / 2f,
+                    deleteBadgeTextPaint
+                )
+            }
+        }
+        canvas.restore()
+    }
+
+    /** On-screen size of the blue touch targets around a selected image. */
+    private val imageHitPx: Float get() = 30f * resources.displayMetrics.density
+
+    /** On-screen radius of the drawn resize dot / delete badge. */
+    private val imageHandlePx: Float get() = 10f * resources.displayMetrics.density
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
@@ -128,12 +366,15 @@ class DrawingCanvasView(
         if (input.pageFlowEnabled) {
             input.pageCount = pages.size
             input.flowIndex = activeIndex
+            input.pageTopOf = { PageFlow.pageTop(it, pages) }
+            input.pageIndexAtY = { PageFlow.indexForDocY(it, pages) }
         }
+        pendingNewPage = false
     }
 
     /**
      * Positions the flow so page [index] starts near the top of the viewport
-     * (or centres the whole flow when it fits on screen).
+     * (pinned at the top so the page edge lines up with the bottom of the tab bar).
      */
     fun scrollToPage(index: Int) {
         if (!pagesMode || flowPages.isEmpty()) return
@@ -145,46 +386,42 @@ class DrawingCanvasView(
         val t = engine.transform
         val viewH = height.toFloat()
         if (viewH < 1f) return
-        val topSlack = 64f * resources.displayMetrics.density
-        val bottomSlack = 64f * resources.displayMetrics.density
-        val docTop = PageFlow.pageTop(clamped)
-        val docH = (PageFlow.pageTop(last) + NotePage.PAGE_HEIGHT) * t.zoom
-        val desired = topSlack - docTop * t.zoom
-        val minY = viewH - bottomSlack - docH
-        val maxY = topSlack
-        val offY = if (minY >= maxY) (viewH - docH) / 2f else desired.coerceIn(minY, maxY)
+        val docTop = PageFlow.pageTop(clamped, flowPages)
+        val docH = PageFlow.totalHeight(flowPages) * t.zoom
+        val desired = topSlackPx - docTop * t.zoom
+        val minY = viewH - bottomSlackPx - docH
+        val maxY = topSlackPx
+        val offY = if (minY >= maxY) maxY else desired.coerceIn(minY, maxY)
         if (offY != t.offsetY) {
             t.apply(t.zoom, t.offsetX, offY)
         }
     }
 
-    /** Re-positions the camera so the paper page fills the viewport width. */
+    /** Re-positions the camera so the widest paper page fills the viewport width. */
     fun fitPageToWidth() {
         if (!pagesMode) return
         val viewW = width.toFloat()
         val viewH = height.toFloat()
         if (viewW < 1f || viewH < 1f) return
-        val pageW = NotePage.PAGE_WIDTH
-        val pageH = NotePage.PAGE_HEIGHT
+        val maxW = PageFlow.maxWidth(flowPages)
         val marginX = 32f * resources.displayMetrics.density
-        val topMargin = 64f * resources.displayMetrics.density
-        val bottomMargin = 64f * resources.displayMetrics.density
-        var zoom = (viewW - 2f * marginX) / pageW
+        var zoom = (viewW - 2f * marginX) / maxW
         zoom = zoom.coerceIn(CameraTransform.MIN_ZOOM, CameraTransform.MAX_ZOOM)
-        val scaledPageH = pageH * zoom
-        val offsetX = (viewW - pageW * zoom) / 2f
-        val offsetY = when {
-            scaledPageH + topMargin + bottomMargin <= viewH ->
-                (viewH - scaledPageH) / 2f                    // page fits vertically – centre
-            else -> topMargin                                   // scrollable – pin top
-        }
+        val offsetX = (viewW - maxW * zoom) / 2f
+        val offsetY = topSlackPx
         engine.transform.apply(zoom, offsetX, offsetY)
     }
 
     /**
      * Keeps the whole page flow roughly on-screen so the user cannot pan it
-     * fully out of view. Vertical clamping is done against the full stack of
-     * pages (PDF-like "can't scroll past the ends").
+     * fully out of view.
+     *
+     * Horizontal movement is tightly limited: the page stack can never slide
+     * far enough to expose the desk on either side, so "side to side" scrolling
+     * is essentially disabled at fit zoom. Vertically the stack is clamped so
+     * its top never rises above the canvas top edge (i.e. past the tab bar);
+     * pressing past the bottom of
+     * the last page requests a new page via [onRequestNewPage].
      */
     fun clampTransform() {
         if (!pagesMode) return
@@ -192,30 +429,48 @@ class DrawingCanvasView(
         val viewH = height.toFloat()
         if (viewW < 1f || viewH < 1f) return
         val t = engine.transform
-        val pageW = NotePage.PAGE_WIDTH * t.zoom
+        val maxW = PageFlow.maxWidth(flowPages)
+        val pageW = maxW * t.zoom
+        val totalDocH = PageFlow.totalHeight(flowPages) * t.zoom
 
-        val totalDocH =
-            if (flowPages.isEmpty()) NotePage.PAGE_HEIGHT
-            else (PageFlow.pageTop(flowPages.size - 1) + NotePage.PAGE_HEIGHT) * t.zoom
-
-        val slack = 48f
-        val topSlack = 64f * resources.displayMetrics.density
-        val bottomSlack = 64f * resources.displayMetrics.density
-
-        // Horizontal: keep the page stack's visible region overlapping the view.
-        val minX = slack - pageW
-        val maxX = viewW - slack
+        // Horizontal: page edges can never leave the viewport by more than the
+        // margin, so sideways scrolling ends once the page fills the width.
+        val minX = viewW - pageW - marginPx
+        val maxX = marginPx
         var offX = t.offsetX
         if (minX >= maxX) offX = (minX + maxX) / 2f else offX = offX.coerceIn(minX, maxX)
 
-        // Vertical: flow top can't sink below topSlack, flow bottom stays above
-        // viewH - bottomSlack ("can't scroll past the ends").
-        val minY = viewH - bottomSlack - totalDocH
-        val maxY = topSlack
+        // Vertical: the flow top is always pinned at or below the top-bar slack,
+        // and its bottom stays above the bottom edge. Even when the whole flow
+        // fits on screen it is never centred above that line, so pages can't
+        // ride up under the top bar.
+        val minY = viewH - bottomSlackPx - totalDocH
+        val maxY = topSlackPx
         var offY = t.offsetY
         if (minY >= maxY) {
-            offY = (viewH - totalDocH) / 2f   // whole flow fits – keep centred
+            offY = maxY   // fits – pin the top at the slack line
         } else {
+            val trigger = NotePage.PAGE_GAP * t.zoom * 0.5f
+            // Only auto-add after a page that actually has content, so scrolling
+            // past a deliberately blank page doesn't spawn endless empty ones.
+            // The active page's ink lives in the engine (not yet flushed into the
+            // NotePage), so include it – otherwise you'd have to switch pages
+            // before a fresh stroke could unlock auto-add.
+            val lastIdx = flowPages.lastIndex
+            val last = flowPages.getOrNull(lastIdx)
+            val engineInk = flowActiveIndex == lastIdx &&
+                (engine.strokes.isNotEmpty() ||
+                    (engine.activeStroke?.points?.size ?: 0) > 1)
+            val hasContent = last != null && (
+                last.strokes.isNotEmpty() || last.title.isNotBlank() ||
+                    last.images.isNotEmpty() || engineInk
+                )
+            if (hasContent && offY < minY - trigger && !pendingNewPage) {
+                pendingNewPage = true
+                onRequestNewPage?.invoke()
+            } else if (offY >= minY) {
+                pendingNewPage = false
+            }
             offY = offY.coerceIn(minY, maxY)
         }
 
@@ -252,6 +507,7 @@ class DrawingCanvasView(
         canvas.scale(t.zoom, t.zoom)
 
         drawBackground(canvas, t)
+        drawImages(canvas, infiniteImages, 0f, 0f)
         drawStrokes(canvas)
         canvas.restore()
     }
@@ -264,63 +520,64 @@ class DrawingCanvasView(
         canvas.drawRect(0f, 0f, w, h, deskPaint)
 
         val t = engine.transform
-        val pageW = NotePage.PAGE_WIDTH
-        val pageH = NotePage.PAGE_HEIGHT
         val count = flowPages.size
+
+        // Hard clip below the top band: no page can ever be drawn above this
+        // line, so scrolled-up pages are always visibly cut off at the top bar.
+        canvas.save()
+        canvas.clipRect(0f, topSlackPx, w, h)
 
         canvas.save()
         canvas.translate(t.offsetX, t.offsetY)
         canvas.scale(t.zoom, t.zoom)
 
-        val first = if (count == 0) 0 else PageFlow.indexForDocY(t.screenToDocY(0f), count)
-        val last = if (count == 0) 0 else PageFlow.indexForDocY(t.screenToDocY(h), count)
+        val first = if (count == 0) 0 else PageFlow.indexForDocY(t.screenToDocY(0f), flowPages)
+        val last = if (count == 0) 0 else PageFlow.indexForDocY(t.screenToDocY(h), flowPages)
         for (i in first..last) {
-            drawFlowPage(canvas, t, i, pageW, pageH)
+            drawFlowPage(canvas, i)
         }
 
         canvas.restore()
+        canvas.restore()
     }
 
-    private fun drawFlowPage(
-        canvas: Canvas,
-        t: CameraTransform,
-        index: Int,
-        pageW: Float,
-        pageH: Float
-    ) {
-        val top = PageFlow.pageTop(index)
+    private fun drawFlowPage(canvas: Canvas, index: Int) {
         val page = flowPages.getOrNull(index) ?: return
+        val top = PageFlow.pageTop(index, flowPages)
+        val maxW = PageFlow.maxWidth(flowPages)
+        val x = (maxW - page.width) / 2f
+        val w = page.width
+        val h = page.height
 
         // Paper rectangle.
         pagePaint.color = engine.paperColor
-        canvas.drawRect(0f, top, pageW, top + pageH, pagePaint)
+        canvas.drawRect(x, top, x + w, top + h, pagePaint)
 
-        // Clipped background + strokes.
+        // Clipped background + images + strokes.
         canvas.save()
-        canvas.clipRect(0f, top, pageW, top + pageH)
-
+        canvas.clipRect(x, top, x + w, top + h)
+        drawPageBackground(canvas, page.pageBackground, x, x + w, top, top + h)
+        drawImages(canvas, page.images, x, top)
+        canvas.save()
+        canvas.translate(0f, top)   // engine strokes are page-local in y
         if (index == flowActiveIndex) {
-            drawPageBackground(canvas, engine.pageBackground, 0f, pageW, top, top + pageH)
-            canvas.save()
-            canvas.translate(0f, top)   // engine strokes are page-local
             drawStrokes(canvas)
-            canvas.restore()
         } else {
-            drawPageBackground(canvas, page.pageBackground, 0f, pageW, top, top + pageH)
             drawCompletedStrokes(canvas, page.strokes)
         }
+        canvas.restore()
 
         val title = page.title
         if (title.isNotBlank()) {
             val isDarkPaper = gridColor(engine.paperColor) == 0xFF4A4A4A.toInt()
             titlePaint.color = if (isDarkPaper) 0xFFEDEDED.toInt() else 0xFF444A52.toInt()
-            canvas.drawText(title, pageW / 2f, top + 78f, titlePaint)
+            canvas.drawText(title, x + w / 2f, top + 78f, titlePaint)
         }
 
         canvas.restore()
 
         // Subtle border around page.
-        canvas.drawRect(0f, top, pageW, top + pageH, pageBorderPaint)
+        canvas.drawRect(x, top, x + w, top + h, pageBorderPaint)
     }
 
     // ---- Shared drawing helpers ---------------------------------------------
@@ -471,5 +728,15 @@ class DrawingCanvasView(
             canvas.drawText(line, left + 12f, y, hudPaint)
             y += lineHeight
         }
+    }
+
+    companion object {
+        // Cut off is exactly at the top bar: the canvas starts below the tab
+        // strip, so a 0 slack puts the page edge flush against the bar's bottom.
+        private const val TOP_SLACK_DP = 0f
+        // No bottom cutoff - content may scroll to the very bottom edge.
+        private const val BOTTOM_SLACK_DP = 0f
+        private const val MARGIN_DP = 48f
+        private const val MIN_IMAGE_SIZE = 40f
     }
 }

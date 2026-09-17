@@ -1,6 +1,10 @@
 package com.nicholas.onote.ui
 
+import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -10,10 +14,14 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.Button
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -27,8 +35,13 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.nicholas.onote.data.NoteStore
 import com.nicholas.onote.data.PageMode
+import com.nicholas.onote.drawing.FingerGesture
+import com.nicholas.onote.drawing.GestureAction
 import com.nicholas.onote.drawing.PageBackground
 import com.nicholas.onote.drawing.DrawingEngine
 import com.nicholas.onote.settings.AppSettings
@@ -39,9 +52,42 @@ import com.nicholas.onote.settings.ThemeMode
 fun SettingsScreen(
     settings: AppSettings,
     engine: DrawingEngine?,
-    onBack: () -> Unit
+    store: NoteStore,
+    onBack: () -> Unit,
+    onRestored: () -> Unit,
+    onBackupAll: () -> Unit,
+    onDriveFolderLinked: (android.net.Uri) -> Unit
 ) {
     var aboutOpen by remember { mutableStateOf(false) }
+    var backupStatus by remember { mutableStateOf("") }
+
+    val context = LocalContext.current
+    val folderLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocumentTree()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                )
+            }
+            onDriveFolderLinked(uri)
+            backupStatus = "Drive folder linked – creating ONote folder…"
+        }
+    }
+    val restoreLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            val json = context.contentResolver.openInputStream(uri)?.use {
+                it.readBytes().toString(Charsets.UTF_8)
+            }
+            val ok = json != null && store.restoreFromBackup(json)
+            backupStatus = if (ok) "Notebooks restored" else "Restore failed"
+            if (ok) onRestored()
+        }
+    }
 
     Scaffold(
         topBar = {
@@ -103,6 +149,24 @@ fun SettingsScreen(
 
             HorizontalDivider()
 
+            SectionTitle("Gestures")
+
+            Text(
+                "Assign an action to each finger gesture. Move gestures pan the " +
+                    "page; taps, double taps and holds trigger the chosen action.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            for (gesture in FingerGesture.entries) {
+                GestureRow(
+                    gesture = gesture,
+                    current = settings.gestureAction(gesture.key)
+                ) { action ->
+                    settings.updateGestureAction(gesture.key, action)
+                }
+            }
+
             SectionTitle("New notebooks")
 
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -137,6 +201,73 @@ fun SettingsScreen(
                 checked = settings.resumeLast
             ) {
                 settings.updateResumeLast(it)
+            }
+
+            ToggleRow(
+                title = "Confirm before trashing",
+                subtitle = "Ask before each notebook moves to the trash",
+                checked = settings.confirmTrashDialog
+            ) {
+                settings.updateConfirmTrashDialog(it)
+            }
+
+            HorizontalDivider()
+
+            SectionTitle("Backup & sync (Google Drive)")
+
+            Text(
+                "Link any Google Drive folder once; ONote then makes an \"ONote\" " +
+                    "folder inside it and every notebook is saved there as its own " +
+                    "\"<name>.onote\" file (with its images inside), so you can open " +
+                    "or share any notebook on its own.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Text("Drive folder", style = MaterialTheme.typography.labelLarge)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedButton(
+                    onClick = { folderLauncher.launch(null) },
+                    enabled = settings.driveFolderUri == null
+                ) {
+                    Text("Choose folder…")
+                }
+                OutlinedButton(
+                    onClick = {
+                        settings.updateDriveFolder(null, null)
+                        backupStatus = ""
+                    },
+                    enabled = settings.driveFolderUri != null
+                ) {
+                    Text("Unlink")
+                }
+                if (settings.driveFolderUri != null) {
+                    Text(
+                        "Linked",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary
+                    )
+                }
+            }
+            Button(
+                onClick = onBackupAll,
+                enabled = settings.driveFolderUri != null,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Back up all notebooks now")
+            }
+
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = { restoreLauncher.launch(arrayOf("application/json")) }) {
+                    Text("Restore old backup…")
+                }
+            }
+            if (backupStatus.isNotBlank()) {
+                Text(backupStatus, style = MaterialTheme.typography.bodySmall)
             }
 
             HorizontalDivider()
@@ -176,5 +307,53 @@ private fun ToggleRow(
         }
         Spacer(Modifier.size(8.dp))
         Switch(checked = checked, onCheckedChange = onChanged)
+    }
+}
+
+@Composable
+private fun GestureRow(
+    gesture: FingerGesture,
+    current: GestureAction,
+    onChanged: (GestureAction) -> Unit
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    val options = if (gesture.isMoveGesture) {
+        GestureAction.entries.filter { it.moveAction }
+    } else {
+        listOf(GestureAction.NONE) + GestureAction.entries.filter { !it.moveAction }
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            gesture.displayName,
+            style = MaterialTheme.typography.bodyLarge,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        Box {
+            TextButton(onClick = { menuOpen = true }) {
+                Text(
+                    current.displayName,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    color = if (current == GestureAction.NONE)
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.primary
+                )
+            }
+            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                for (option in options) {
+                    DropdownMenuItem(
+                        text = { Text(option.displayName, maxLines = 1) },
+                        onClick = {
+                            menuOpen = false
+                            onChanged(option)
+                        }
+                    )
+                }
+            }
+        }
     }
 }

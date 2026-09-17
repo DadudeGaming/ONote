@@ -4,6 +4,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.nicholas.onote.data.PageSource
+import kotlin.math.hypot
 
 /**
  * Holds all drawing state: the in-progress stroke, finalized strokes, a
@@ -49,6 +50,10 @@ class DrawingEngine {
     val canUndo: Boolean get() = undoStack.isNotEmpty()
     val canRedo: Boolean get() = redoStack.isNotEmpty()
 
+    /** Bumped on every change to the undo/redo stacks so toolbar buttons update. */
+    var editCount by mutableStateOf(0)
+        private set
+
     var activeStroke: ActiveStroke? = null
         private set
 
@@ -70,6 +75,7 @@ class DrawingEngine {
         }
         undoStack.clear()
         redoStack.clear()
+        editCount++
     }
 
     /** Copies the current page (strokes, paper, camera) back into [source]. */
@@ -102,6 +108,7 @@ class DrawingEngine {
         undoStack.addLast(Edit.Add(completed))
         redoStack.clear()
         activeStroke = null
+        editCount++
         onChanged()
     }
 
@@ -145,6 +152,7 @@ class DrawingEngine {
             undoStack.addLast(Edit.Remove(pendingErase.toList()))
             redoStack.clear()
             pendingErase.clear()
+            editCount++
             onChanged()
         }
     }
@@ -154,12 +162,129 @@ class DrawingEngine {
         pendingErase.clear()
     }
 
+    /**
+     * Ends the pen stroke, but first checks whether it was actually a quick
+     * scribble-out gesture (rapid back-and-forth, little net travel, dense
+     * reversals). A recognisable scribble erases itself plus every stroke it
+     * passes within [radius] of — recorded as a single undoable action — so
+     * ordinary writing is never misread as an erase.
+     */
+    fun endStrokeOrScribble(radius: Float) {
+        val stroke = activeStroke ?: return
+        val points = stroke.points
+        if (isScribbleGesture(points) && penHitsInk(points, radius)) {
+            val completed =
+                CompletedStroke(stroke.color, points, stroke.baseWidth, stroke.tool)
+            _strokes.add(completed)
+            val removed = ArrayList<CompletedStroke>()
+            for (existing in _strokes) {
+                if (existing === completed || strokeHitsPoints(existing, points, radius)) {
+                    removed.add(existing)
+                }
+            }
+            _strokes.removeAll(removed)
+            undoStack.addLast(Edit.Remove(removed))
+            redoStack.clear()
+            activeStroke = null
+            editCount++
+            onChanged()
+            return
+        }
+        endStroke()
+    }
+
+    /**
+     * A scribble is quick, self-contained zig-zag: many direction reversals
+     * per unit of length, ending near where it started, staying in a compact
+     * region. Handwriting — even cursive "n"s, "m"s and "he" runs — travels
+     * too far and turns too rarely to qualify.
+     */
+    private fun isScribbleGesture(points: List<StrokePoint>): Boolean {
+        if (points.size < 16) return false
+        val dt = points.last().timestamp - points.first().timestamp
+        if (dt < 0 || dt > 900L) return false
+
+        var pathLen = 0f
+        var flips = 0
+        var prevDx = 0
+        var prevDy = 0
+        var minX = Float.MAX_VALUE
+        var minY = Float.MAX_VALUE
+        var maxX = -Float.MAX_VALUE
+        var maxY = -Float.MAX_VALUE
+
+        for (i in 1 until points.size) {
+            val dx = points[i].x - points[i - 1].x
+            val dy = points[i].y - points[i - 1].y
+            pathLen += hypot(dx, dy)
+            flips = countFlip(prevDx, dx, flips) { prevDx = it }
+            flips = countFlip(prevDy, dy, flips) { prevDy = it }
+            if (points[i].x < minX) minX = points[i].x
+            if (points[i].y < minY) minY = points[i].y
+            if (points[i].x > maxX) maxX = points[i].x
+            if (points[i].y > maxY) maxY = points[i].y
+        }
+
+        val first = points.first()
+        val last = points.last()
+        val net = hypot(last.x - first.x, last.y - first.y)
+        val width = maxX - minX
+        val height = maxY - minY
+        if (pathLen < 50f || flips < 6) return false
+        return net < pathLen * 0.30f &&
+            width < pathLen * 0.75f &&
+            height < pathLen * 0.30f &&
+            flips * 18f >= pathLen
+    }
+
+    /** Counts a left/right (or up/down) direction reversal for delta [d]. */
+    private fun countFlip(prev: Int, d: Float, count: Int, update: (Int) -> Unit): Int {
+        val dir = if (d > 1.2f) 1 else if (d < -1.2f) -1 else 0
+        if (dir != 0) {
+            if (prev != 0 && dir != prev) return count + 1
+            update(dir)
+        }
+        return count
+    }
+
+    private fun strokeHitsPoints(
+        stroke: CompletedStroke,
+        points: List<StrokePoint>,
+        radius: Float
+    ): Boolean {
+        val r2 = radius * radius
+        for (p in stroke.points) {
+            for (s in points) {
+                val dx = p.x - s.x
+                val dy = p.y - s.y
+                if (dx * dx + dy * dy <= r2) return true
+            }
+        }
+        return false
+    }
+
+    /** True only when the gesture actually crosses existing ink. */
+    private fun penHitsInk(points: List<StrokePoint>, radius: Float): Boolean {
+        val r2 = radius * radius
+        for (other in _strokes) {
+            for (p in other.points) {
+                for (s in points) {
+                    val dx = p.x - s.x
+                    val dy = p.y - s.y
+                    if (dx * dx + dy * dy <= r2) return true
+                }
+            }
+        }
+        return false
+    }
+
     fun undo() {
         if (activeStroke != null || isErasing) return
         if (undoStack.isNotEmpty()) {
             val edit = undoStack.removeLast()
             edit.revert(this)
             redoStack.addLast(edit)
+            editCount++
             onChanged()
         }
     }
@@ -170,6 +295,7 @@ class DrawingEngine {
             val edit = redoStack.removeLast()
             edit.apply(this)
             undoStack.addLast(edit)
+            editCount++
             onChanged()
         }
     }
@@ -180,6 +306,7 @@ class DrawingEngine {
         undoStack.addLast(Edit.Remove(_strokes.toList()))
         redoStack.clear()
         _strokes.clear()
+        editCount++
         onChanged()
     }
 

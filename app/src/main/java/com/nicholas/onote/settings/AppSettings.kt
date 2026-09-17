@@ -5,6 +5,7 @@ import android.content.SharedPreferences
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import com.nicholas.onote.drawing.GestureAction
 import com.nicholas.onote.drawing.PageBackground
 import com.nicholas.onote.drawing.Tool
 import com.nicholas.onote.data.PageMode
@@ -56,6 +57,98 @@ class AppSettings(context: Context) {
     var resumeLast: Boolean by mutableStateOf(prefs.getBoolean(KEY_RESUME, true))
     var lastOpenedDoc: String? by mutableStateOf(prefs.getString(KEY_LAST_DOC, null))
 
+    /** Per-gesture action overrides (figure key → action). Missing keys = defaults. */
+    var gestureActions: Map<String, GestureAction> by mutableStateOf(loadGestureActions())
+
+    /** When false, "Move to trash" acts immediately with no confirmation. */
+    var confirmTrashDialog: Boolean by mutableStateOf(prefs.getBoolean(KEY_CONFIRM_TRASH, true))
+
+    /** When false, "Delete page" removes the page without an "are you sure". */
+    var confirmDeletePage: Boolean by mutableStateOf(prefs.getBoolean(KEY_CONFIRM_PAGE, true))
+
+    /** driveLinks: notebook id → content:// URI backing it up on Google Drive. */
+    private val driveLinks = HashMap<String, String>().apply {
+        val raw = prefs.getString(KEY_DRIVE_LINKS, null) ?: return@apply
+        runCatching {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val o = arr.getJSONObject(i)
+                put(o.getString("id"), o.getString("uri"))
+            }
+        }
+    }
+
+    /** A linked Google Drive folder (SAF tree URI); notebooks auto-save there. */
+    var driveFolderUri: String? by mutableStateOf(prefs.getString(KEY_DRIVE_FOLDER, null))
+
+    /** The "ONote" folder inside [driveFolderUri] where backups are written. */
+    var driveFolderDocId: String? by mutableStateOf(prefs.getString(KEY_DRIVE_FOLDER_ID, null))
+
+    fun driveLink(docId: String): String? = driveLinks[docId]
+
+    fun updateDriveLink(docId: String, uri: String) {
+        driveLinks[docId] = uri
+        persistDriveLinks()
+    }
+
+    fun updateDriveFolder(uri: String?, folderId: String?) {
+        driveFolderUri = uri
+        driveFolderDocId = folderId
+        prefs.edit().apply {
+            if (uri == null) remove(KEY_DRIVE_FOLDER) else putString(KEY_DRIVE_FOLDER, uri)
+            if (folderId == null) remove(KEY_DRIVE_FOLDER_ID)
+            else putString(KEY_DRIVE_FOLDER_ID, folderId)
+        }.apply()
+    }
+
+    fun removeDriveLink(docId: String) {
+        driveLinks.remove(docId)
+        persistDriveLinks()
+    }
+
+    fun gestureAction(key: String): GestureAction =
+        gestureActions[key] ?: DefaultGestures[key] ?: GestureAction.NONE
+
+    fun updateGestureAction(key: String, action: GestureAction) {
+        gestureActions = gestureActions + (key to action)
+        persistGestureActions()
+    }
+
+    private fun loadGestureActions(): Map<String, GestureAction> {
+        val raw = prefs.getString(KEY_GESTURES, null) ?: return emptyMap()
+        return runCatching {
+            val arr = JSONArray(raw)
+            buildMap {
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    put(o.getString("key"), GestureAction.valueOf(o.getString("action")))
+                }
+            }
+        }.getOrDefault(emptyMap())
+    }
+
+    private fun persistGestureActions() {
+        val arr = JSONArray()
+        for ((key, action) in gestureActions) {
+            val o = JSONObject()
+            o.put("key", key)
+            o.put("action", action.name)
+            arr.put(o)
+        }
+        prefs.edit().putString(KEY_GESTURES, arr.toString()).apply()
+    }
+
+    private fun persistDriveLinks() {
+        val arr = JSONArray()
+        for ((id, uri) in driveLinks) {
+            val o = JSONObject()
+            o.put("id", id)
+            o.put("uri", uri)
+            arr.put(o)
+        }
+        prefs.edit().putString(KEY_DRIVE_LINKS, arr.toString()).apply()
+    }
+
     fun updateThemeMode(mode: ThemeMode) {
         themeMode = mode
         prefs.edit().putString(KEY_THEME, mode.name).apply()
@@ -79,6 +172,16 @@ class AppSettings(context: Context) {
     fun updateLastOpenedDoc(id: String) {
         lastOpenedDoc = id
         prefs.edit().putString(KEY_LAST_DOC, id).apply()
+    }
+
+    fun updateConfirmTrashDialog(enabled: Boolean) {
+        confirmTrashDialog = enabled
+        prefs.edit().putBoolean(KEY_CONFIRM_TRASH, enabled).apply()
+    }
+
+    fun updateConfirmDeletePage(enabled: Boolean) {
+        confirmDeletePage = enabled
+        prefs.edit().putBoolean(KEY_CONFIRM_PAGE, enabled).apply()
     }
 
     fun updatePalmRejection(enabled: Boolean) {
@@ -155,6 +258,36 @@ class AppSettings(context: Context) {
         private const val KEY_DEFAULT_MODE = "default_mode"
         private const val KEY_RESUME = "resume_last"
         private const val KEY_LAST_DOC = "last_opened_doc"
+        private const val KEY_CONFIRM_TRASH = "confirm_trash_dialog"
+        private const val KEY_CONFIRM_PAGE = "confirm_delete_page"
+        private const val KEY_DRIVE_LINKS = "drive_links"
+        private const val KEY_DRIVE_FOLDER = "drive_folder"
+        private const val KEY_DRIVE_FOLDER_ID = "drive_folder_id"
+        private const val KEY_GESTURES = "gesture_actions"
+
+        val DefaultGestures = mapOf(
+            // Moves: 1 finger pans, 2 fingers pan & zoom (the classic two-finger
+            // scroll), 3/4 fingers do nothing until assigned.
+            "move1" to GestureAction.MOVE_PAGE,
+            "move2" to GestureAction.PAN_ZOOM,
+            "move3" to GestureAction.NONE,
+            "move4" to GestureAction.NONE,
+            // Taps: none by default.
+            "tap1" to GestureAction.NONE,
+            "tap2" to GestureAction.NONE,
+            "tap3" to GestureAction.NONE,
+            "tap4" to GestureAction.NONE,
+            // Double taps: 2 = undo, 3 = redo (current behaviour).
+            "dtap1" to GestureAction.NONE,
+            "dtap2" to GestureAction.UNDO,
+            "dtap3" to GestureAction.REDO,
+            "dtap4" to GestureAction.NONE,
+            // Holds: 3 fingers = page menu (current behaviour).
+            "hold1" to GestureAction.NONE,
+            "hold2" to GestureAction.NONE,
+            "hold3" to GestureAction.PAGE_MENU,
+            "hold4" to GestureAction.NONE
+        )
 
         val DefaultPenSlots = listOf(
             PenSlot(Tool.BALLPOINT, 0xFF1A1A1A.toInt(), 4f),

@@ -14,25 +14,31 @@ import kotlin.math.max
  * Palm rejection rules:
  *  - While any stylus is down, every touch pointer is ignored (a hand resting on
  *    the screen writes nothing).
- *  - With palm rejection enabled, one finger nothing-but-pan (when page flow is
- *    active), two fingers pan/zoom, three fingers hold-for-menu or double-tap.
- *    A stylus never gestures.
+ *  - With palm rejection enabled, fingers never draw; gestures (move / tap /
+ *    double-tap / hold with 1-4 fingers) do whatever the [gestureAction] map
+ *    says - see [GestureConfig] / AppSettings. A stylus never gestures.
  *  - With palm rejection disabled, any pointer draws like the original
  *    prototype.
  *
  * In "Pages" notebooks (`[pageFlowEnabled]`) all pages are stacked vertically;
  * [beginStroke] routes the pen to whichever page sits under the stylus and
- * records points in that page's local coordinate system.
+ * records points in that page's local coordinate system. Page geometry is
+ * provided by [pageTopOf]/[pageIndexAtY] so mixed orientations stack cleanly.
  *
- * Finger gestures (pages & infinite): 2-finger double-tap = undo,
- * 3-finger double-tap = redo, 3-finger long-press = page menu ([onLongPress3]).
+ * Configurable finger gestures: whatever action is assigned to a gesture fires
+ * through [onGestureAction]; the default map keeps 2-finger double-tap = undo,
+ * 3-finger double-tap = redo, 3-finger long-press = page menu.
+ *
+ * Scribble-to-erase: a quick back-and-forth wiggle with the pen (≥ 10 points,
+ * multiple reversals, little net travel) is treated as a "scribble erase" —
+ * whatever ink the wiggle crosses is removed when the pen lifts.
  */
 class StylusInputHandler(
     private val engine: DrawingEngine,
     private val invalidate: () -> Unit
 ) {
 
-    enum class Mode { IDLE, TOOL, GESTURE, PAN }
+    enum class Mode { IDLE, TOOL, GESTURE }
 
     private val pointers = HashMap<Int, Int>() // pointerId -> toolType
 
@@ -40,12 +46,6 @@ class StylusInputHandler(
         private set
     var mode = Mode.IDLE
         private set
-
-    /**
-     * When true (Pages notebooks with palm rejection on), a single finger
-     * drags the page instead of doing nothing – giving a PDF-like scroll.
-     */
-    var panEnabled = false
 
     // ---- Page flow -----------------------------------------------------------
 
@@ -58,24 +58,22 @@ class StylusInputHandler(
     /** The page the engine is currently hydrated from. */
     var flowIndex = 0
 
+    /** Document-space y of page [i]'s top edge (set by the canvas). */
+    var pageTopOf: ((Int) -> Float)? = null
+
+    /** Which page owns document-space y (set by the canvas). */
+    var pageIndexAtY: ((Float) -> Int)? = null
+
     /** Invoked when a pen stroke should start on a different page. */
     var onActivePageChanged: ((Int) -> Unit)? = null
 
-    // ---- Finger gestures ------------------------------------------------------
+    // ---- Configurable finger gestures ----------------------------------------
 
-    /** 2-finger double-tap → undo. */
-    var onDoubleTap2: (() -> Unit)? = null
+    /** Looks up the configured action for a gesture key (e.g. "dtap2"). */
+    var gestureAction: ((String) -> GestureAction)? = null
 
-    /** 3-finger double-tap → redo. */
-    var onDoubleTap3: (() -> Unit)? = null
-
-    /** 3-finger long-press → page menu; the Int is the page index under the hold. */
-    var onLongPress3: ((Int) -> Unit)? = null
-
-    // One-finger pan anchors.
-    private var panPointerId = -1
-    private var lastPanX = 0f
-    private var lastPanY = 0f
+    /** Fires when a gesture runs; the Int is the page index under the gesture. */
+    var onGestureAction: ((GestureAction, Int) -> Unit)? = null
 
     /**
      * True while the S Pen side button is held with the tool on a pen:
@@ -92,18 +90,25 @@ class StylusInputHandler(
     private var startOffsetX = 0f
     private var startOffsetY = 0f
 
-    // Multi-finger tap / hold bookkeeping.
+    // Multi-finger tap / hold / move bookkeeping.
     private val fingerOrigins = HashMap<Int, FloatArray>() // id -> [startX, startY]
     private var gestureDownTime = 0L
     private var gestureMaxFingers = 0
     private var gestureMaxDist = 0f
     private var gestureFocalX = 0f
     private var gestureFocalY = 0f
+
+    // Active pan/zoom drag.
+    private var dragActive = false
+    private var dragMoveOnly = false
+
     private var lastTapFingers = 0
     private var lastTapTime = 0L
     private var holdFired = false
     private var holdGeneration = 0
     private var holdCheck: Runnable? = null
+    private var pendingTapGeneration = 0
+    private var pendingTapCheck: Runnable? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
     // Debug instrumentation.
@@ -150,8 +155,8 @@ class StylusInputHandler(
         // S Pen always draws. With palm rejection off, fingers draw too.
         if (tool == MotionEvent.TOOL_TYPE_STYLUS || !engine.palmRejection) {
             beginStroke(event, 0)
-        } else if (panEnabled && tool == MotionEvent.TOOL_TYPE_FINGER) {
-            beginPan(event, 0)
+        } else {
+            beginTouchGesture()
         }
     }
 
@@ -162,14 +167,6 @@ class StylusInputHandler(
         }
         if (gestureDownTime == 0L) gestureDownTime = event.eventTime
         gestureMaxFingers = max(gestureMaxFingers, touchPointerIds().size)
-        if (gestureMaxFingers >= 3) scheduleHold()
-    }
-
-    private fun beginPan(event: MotionEvent, idx: Int) {
-        panPointerId = event.getPointerId(idx)
-        lastPanX = event.getX(idx)
-        lastPanY = event.getY(idx)
-        mode = Mode.PAN
     }
 
     private fun onActionPointerDown(event: MotionEvent) {
@@ -192,10 +189,20 @@ class StylusInputHandler(
             return
         }
 
-        when (touchPointerIds().size) {
-            2 -> startGesture(event)
-            else -> cancelFingerGesture()   // 3+ fingers: hold / double-tap only
+        val count = touchPointerIds().size
+        if (count > 4) {
+            cancelFingerGesture()   // more fingers than we model: bail out
+            return
         }
+        if (mode != Mode.GESTURE) mode = Mode.GESTURE
+
+        // A new finger arrives: the mapping may change (e.g. 1-finger pan
+        // becomes 2-finger pan/zoom, or whatever the user assigned).
+        val act = actionFor(FingerGesture.move(count)?.key ?: "")
+        dragActive = act == GestureAction.MOVE_PAGE || act == GestureAction.PAN_ZOOM
+        dragMoveOnly = act == GestureAction.MOVE_PAGE
+        if (dragActive) beginDragAnchors(event)
+        scheduleHold(count)
     }
 
     private fun onActionMove(event: MotionEvent) {
@@ -212,25 +219,25 @@ class StylusInputHandler(
             }
         }
         trackFingerMove(event)
-        if (mode == Mode.PAN) {
-            if (stylusPointersActive() > 0) {
-                endPan()
-            } else {
-                val idx = event.findPointerIndex(panPointerId)
-                if (idx >= 0) {
-                    val x = event.getX(idx)
-                    val y = event.getY(idx)
-                    engine.transform.pan(x - lastPanX, y - lastPanY)
-                    lastPanX = x
-                    lastPanY = y
-                }
-            }
-        }
         if (mode == Mode.GESTURE) {
-            if (touchPointerIds().size >= 3) {
+            val count = touchPointerIds().size
+            if (count > 4) {
                 cancelFingerGesture()
-            } else {
-                updateGesture(event)
+            } else if (dragActive) {
+                val act = actionFor(FingerGesture.move(count)?.key ?: "")
+                when {
+                    act == GestureAction.PAN_ZOOM -> updateGesture(event)
+                    act == GestureAction.MOVE_PAGE -> updatePanOnly(event)
+                    else -> dragActive = false
+                }
+            } else if (count == 1 && gestureMaxDist > MOVE_SLOP_PX) {
+                // A single finger moved: start a 1-finger pan if mapped to one.
+                val act = actionFor(FingerGesture.move(1)?.key ?: "")
+                if (act == GestureAction.MOVE_PAGE || act == GestureAction.PAN_ZOOM) {
+                    dragActive = true
+                    dragMoveOnly = true
+                    beginDragAnchors(event)
+                }
             }
         }
         updateMoveStats(event.eventTime)
@@ -243,28 +250,28 @@ class StylusInputHandler(
         if (id == strokePointerId) {
             finishTool(false)
         }
-        if (id == panPointerId) {
-            endPan()
-        }
         fingerOrigins.remove(id)
         pointers.remove(id)
 
-        if (mode == Mode.GESTURE && touchPointerIds().size < 2) {
-            mode = Mode.IDLE
-        }
         if (mode == Mode.TOOL && strokePointerId == -1) {
             mode = Mode.IDLE
         }
-
-        // When the final finger lifts, evaluate whether the touch was a tap.
-        if (touchPointerIds().isEmpty()) {
-            evaluateTapEnd(event.eventTime, cancelled = false)
+        if (mode == Mode.GESTURE) {
+            val count = touchPointerIds().size
+            if (count == 0) {
+                dragActive = false
+                mode = Mode.IDLE
+                evaluateTapEnd(event.eventTime, cancelled = false)
+            } else if (dragActive) {
+                val act = actionFor(FingerGesture.move(count)?.key ?: "")
+                dragActive = act == GestureAction.MOVE_PAGE || act == GestureAction.PAN_ZOOM
+                dragMoveOnly = act == GestureAction.MOVE_PAGE
+            }
         }
     }
 
     private fun onActionUp(event: MotionEvent, cancelled: Boolean) {
         finishTool(cancelled)
-        endPan()
         mode = Mode.IDLE
         evaluateTapEnd(event.eventTime, cancelled)
         pointers.clear()
@@ -272,17 +279,14 @@ class StylusInputHandler(
         gestureDownTime = 0L
         gestureMaxFingers = 0
         gestureMaxDist = 0f
+        dragActive = false
         cancelHold()
-    }
-
-    private fun endPan() {
-        panPointerId = -1
-        if (mode == Mode.PAN) mode = Mode.IDLE
+        cancelPendingTap()
     }
 
     private fun cancelFingerGesture() {
-        endPan()
         mode = Mode.IDLE
+        dragActive = false
     }
 
     private fun finishTool(cancelled: Boolean) {
@@ -290,11 +294,12 @@ class StylusInputHandler(
         val eraser = erasing(null)
         if (cancelled) {
             if (eraser) engine.cancelErase() else engine.cancelStroke()
-        } else {
-            if (eraser) engine.endErase() else engine.endStroke()
-        }
-        if (eraser) {
+        } else if (eraser) {
+            engine.endErase()
             Log.d(TAG, "erase end strokesRemovedRemaining=${engine.strokeCount}")
+        } else {
+            // Pen lift: decide between a normal stroke and scribble-to-erase.
+            engine.endStrokeOrScribble(scribbleRadius)
         }
         tempEraser = false
         strokePointerId = -1
@@ -327,7 +332,8 @@ class StylusInputHandler(
     /** Global doc coords -> the active page's local coords. */
     private fun toLocal(gx: Float, gy: Float): Pair<Float, Float> {
         if (!pageFlowEnabled) return Pair(gx, gy)
-        return Pair(gx, gy - PageFlow.pageTop(flowIndex))
+        val top = pageTopOf?.invoke(flowIndex) ?: PageFlow.pageTop(flowIndex)
+        return Pair(gx, gy - top)
     }
 
     private fun beginStroke(event: MotionEvent, idx: Int) {
@@ -335,7 +341,8 @@ class StylusInputHandler(
         mode = Mode.TOOL
         val (gx, gy) = globalDoc(event, idx)
         if (pageFlowEnabled) {
-            val target = PageFlow.indexForDocY(gy, pageCount)
+            val target = pageIndexAtY?.invoke(gy)
+                ?: PageFlow.indexForDocY(gy, pageCount)
             if (target != flowIndex) {
                 flowIndex = target
                 onActivePageChanged?.invoke(target)
@@ -356,10 +363,14 @@ class StylusInputHandler(
         )
     }
 
+    /** Erase radius for a scribble: at least the eraser size, scaled by pen. */
+    private val scribbleRadius: Float
+        get() = max(engine.eraseRadius, engine.activeWidth * 3f).coerceAtLeast(24f)
+
     private fun touchPointerIds(): List<Int> =
         pointers.filterValues { it != MotionEvent.TOOL_TYPE_STYLUS }.keys.toList()
 
-    // ---- Finger tracking (tap / hold) ---------------------------------------
+    // ---- Finger tracking (move / tap / hold) ----------------------------------
 
     private fun trackFingerMove(event: MotionEvent) {
         if (fingerOrigins.isEmpty()) return
@@ -372,29 +383,23 @@ class StylusInputHandler(
             }
         }
         gestureMaxDist = max(gestureMaxDist, maxMove)
-        if (gestureMaxFingers >= 3 && maxMove > HOLD_MOVE_PX) cancelHoldScheduling()
-        if (gestureMaxFingers >= 3) {
-            val (fx, fy, _) = focalAndSpan(event)
-            gestureFocalX = fx
-            gestureFocalY = fy
-        }
+        if (maxMove > HOLD_MOVE_PX) cancelHoldScheduling()
+        val (fx, fy, _) = focalAndSpan(event)
+        gestureFocalX = fx
+        gestureFocalY = fy
     }
 
-    private fun scheduleHold() {
-        if (holdFired || !pageFlowEnabled) return
+    private fun scheduleHold(fingers: Int) {
+        val act = actionFor(FingerGesture.hold(fingers)?.key ?: "")
+        if (act == GestureAction.NONE || holdFired) return
         val gen = ++holdGeneration
         val check = Runnable {
             if (gen != holdGeneration) return@Runnable
             if (holdFired) return@Runnable
-            if (gestureMaxFingers >= 3 && touchPointerIds().size >= 3 &&
-                gestureMaxDist < HOLD_MOVE_PX
-            ) {
-                holdFired = true
-                val t = engine.transform
-                val docY = t.screenToDocY(gestureFocalY)
-                val idx = PageFlow.indexForDocY(docY, pageCount)
-                onLongPress3?.invoke(idx)
-            }
+            if (touchPointerIds().size != fingers || fingers > 4) return@Runnable
+            if (gestureMaxDist >= HOLD_MOVE_PX) return@Runnable
+            holdFired = true
+            fireAction(act, engine.transform.screenToDocY(gestureFocalY))
         }
         holdCheck?.let { mainHandler.removeCallbacks(it) }
         holdCheck = check
@@ -411,37 +416,75 @@ class StylusInputHandler(
         holdCheck?.let { mainHandler.removeCallbacks(it) }
     }
 
+    private fun schedulePendingTap(action: GestureAction, docY: Float) {
+        val gen = ++pendingTapGeneration
+        val check = Runnable {
+            if (gen != pendingTapGeneration) return@Runnable
+            fireAction(action, docY)
+        }
+        pendingTapCheck?.let { mainHandler.removeCallbacks(it) }
+        pendingTapCheck = check
+        mainHandler.postDelayed(check, DOUBLE_TAP_MS)
+    }
+
+    private fun cancelPendingTap() {
+        pendingTapGeneration++
+        pendingTapCheck?.let { mainHandler.removeCallbacks(it) }
+    }
+
     private fun evaluateTapEnd(time: Long, cancelled: Boolean) {
         cancelHold()
         if (cancelled || stylusPointersActive() > 0) {
             lastTapFingers = 0
+            lastTapTime = 0L
             return
         }
         val fingers = gestureMaxFingers
         val duration = time - gestureDownTime
         val move = gestureMaxDist
+        val dragged = dragActive
+        val fired = holdFired
         gestureMaxDist = 0f
         gestureMaxFingers = 0
         gestureDownTime = 0L
-        val fired = holdFired
+        dragActive = false
         holdFired = false
 
-        if (fired || fingers < 2 || duration > TAP_MAX_MS || move > TAP_MOVE_PX) {
+        if (fired || dragged || fingers !in 1..4 || duration > TAP_MAX_MS || move > TAP_MOVE_PX) {
             lastTapFingers = 0
+            lastTapTime = 0L
             return
         }
 
+        // A second tap with the same count = double-tap.
         if (lastTapFingers == fingers && time - lastTapTime <= DOUBLE_TAP_MS) {
-            when (fingers) {
-                2 -> onDoubleTap2?.invoke()
-                3 -> onDoubleTap3?.invoke()
+            cancelPendingTap()
+            val dt = actionFor(FingerGesture.doubleTap(fingers)?.key ?: "")
+            if (dt != GestureAction.NONE) {
+                fireAction(dt, engine.transform.screenToDocY(gestureFocalY))
             }
             lastTapFingers = 0
             lastTapTime = 0L
         } else {
+            // First tap: fire the single-tap action after a short delay, so a
+            // quick second tap can turn it into a double-tap instead.
             lastTapFingers = fingers
             lastTapTime = time
+            val tapAct = actionFor(FingerGesture.tap(fingers)?.key ?: "")
+            if (tapAct != GestureAction.NONE) {
+                schedulePendingTap(tapAct, engine.transform.screenToDocY(gestureFocalY))
+            }
         }
+    }
+
+    private fun actionFor(key: String): GestureAction =
+        gestureAction?.invoke(key) ?: GestureAction.NONE
+
+    private fun fireAction(action: GestureAction, docY: Float) {
+        if (action == GestureAction.NONE) return
+        val idx = pageIndexAtY?.invoke(docY)
+            ?: PageFlow.indexForDocY(docY, pageCount)
+        onGestureAction?.invoke(action, idx)
     }
 
     /**
@@ -474,10 +517,8 @@ class StylusInputHandler(
         return Triple(fx, fy, sum / count)
     }
 
-    private fun startGesture(event: MotionEvent) {
+    private fun beginDragAnchors(event: MotionEvent) {
         val (fx, fy, avg) = focalAndSpan(event)
-        if (avg < 1e-3f) return
-        panPointerId = -1
         mode = Mode.GESTURE
         startZoom = engine.transform.zoom
         startOffsetX = engine.transform.offsetX
@@ -485,7 +526,6 @@ class StylusInputHandler(
         startFocalX = fx
         startFocalY = fy
         startAvgSpan = avg
-        Log.d(TAG, "gesture start fingers=${touchPointerIds().size} zoom=$startZoom")
     }
 
     private fun updateGesture(event: MotionEvent) {
@@ -501,6 +541,21 @@ class StylusInputHandler(
 
         val transform = engine.transform
         transform.apply(newZoom, fx - docFocalX * newZoom, fy - docFocalY * newZoom)
+    }
+
+    /** Pan-only (no zoom) for the "Move page" action. */
+    private fun updatePanOnly(event: MotionEvent) {
+        val (fx, fy, _) = focalAndSpan(event)
+        val transform = engine.transform
+        val offX = startOffsetX + (fx - startFocalX)
+        val offY = startOffsetY + (fy - startFocalY)
+        transform.apply(transform.zoom, offX, offY)
+    }
+
+    private fun beginTouchGesture() {
+        mode = Mode.GESTURE
+        dragActive = false
+        scheduleHold(1)
     }
 
     private fun updateMoveStats(time: Long) {
@@ -532,5 +587,6 @@ class StylusInputHandler(
         private const val HOLD_DELAY_MS = 600L
         private const val TAP_MOVE_PX = 28f
         private const val HOLD_MOVE_PX = 28f
+        private const val MOVE_SLOP_PX = 24f
     }
 }
